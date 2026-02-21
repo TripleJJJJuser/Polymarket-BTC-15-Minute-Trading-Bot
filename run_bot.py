@@ -20,6 +20,7 @@ from typing import List, Optional
 import random
 import json
 import urllib.request
+from collections import deque
 
 # Add project to path
 project_root = Path(__file__).parent
@@ -187,8 +188,9 @@ class IntegratedBTCStrategy(Strategy):
             self.grafana_exporter = None
         
         # Price history for signal processing
-        self.price_history = []
+        self.price_history = []  # current instrument convenience view
         self.max_history = 100
+        self.price_history_by_instrument = {}
         self.real_quote_count = 0
         
         # Paper trading tracker
@@ -375,6 +377,8 @@ class IntegratedBTCStrategy(Strategy):
                 seen.add(price_str)
                 unique_history.append(price)
         self.price_history = unique_history
+        if self.instrument_id:
+            self.price_history_by_instrument[self.instrument_id] = deque(self.price_history, maxlen=self.max_history)
         
         # If still not enough, generate synthetic data only in simulation mode
         if len(self.price_history) < 20:
@@ -429,6 +433,9 @@ class IntegratedBTCStrategy(Strategy):
             self.price_history.append(new_price)
             base_price = new_price
         
+        if self.instrument_id:
+            self.price_history_by_instrument[self.instrument_id] = deque(self.price_history, maxlen=self.max_history)
+
         logger.info(f"Generated {needed} synthetic price points")
         logger.info(f"Now have {len(self.price_history)} total price points")
     
@@ -591,8 +598,10 @@ class IntegratedBTCStrategy(Strategy):
         self.selected_symbol = selected.get('symbol', self.selected_symbol)
         new_instrument_id = selected['instrument'].id
         if self.instrument_id != new_instrument_id:
-            self.price_history = []
+            logger.debug(f"Switching instrument history: {self.instrument_id} -> {new_instrument_id}")
+            self.price_history_by_instrument[new_instrument_id] = deque(maxlen=self.max_history)
         self.instrument_id = new_instrument_id
+        self.price_history = list(self._get_current_history())
         self.subscribe_quote_ticks(self.instrument_id)
                         
     def on_quote_tick(self, tick: QuoteTick):
@@ -612,13 +621,22 @@ class IntegratedBTCStrategy(Strategy):
             self.latest_bid = bid_decimal
             self.latest_ask = ask_decimal
             
-            # Update price history
-            self.price_history.append(mid_price)
+            # Update per-instrument price history
+            inst_id = getattr(tick, "instrument_id", self.instrument_id)
+            if inst_id not in self.price_history_by_instrument:
+                self.price_history_by_instrument[inst_id] = deque(maxlen=self.max_history)
+            self.price_history_by_instrument[inst_id].append(mid_price)
+
+            # Keep convenience view pointed at current instrument history only
+            if inst_id == self.instrument_id:
+                self.price_history = list(self.price_history_by_instrument[inst_id])
+
+            logger.debug(
+                f"History[{inst_id}] size={len(self.price_history_by_instrument[inst_id])} "
+                f"(current={self.instrument_id})"
+            )
+
             self.real_quote_count += 1
-            
-            # Limit history size
-            if len(self.price_history) > self.max_history:
-                self.price_history.pop(0)
             
             # Check if we should trade
             now = datetime.now(timezone.utc)
@@ -635,7 +653,7 @@ class IntegratedBTCStrategy(Strategy):
                         logger.info(f"TEST MODE - MINUTE REACHED: {now.strftime('%Y-%m-%d %H:%M:%S')} UTC")
                         logger.info(f"Current price: ${float(mid_price):,.4f}")
                         logger.info(f"Bid: ${float(bid_decimal):,.4f}, Ask: ${float(ask_decimal):,.4f}")
-                        logger.info(f"Price history size: {len(self.price_history)}")
+                        logger.info(f"Price history size (current instrument): {len(self._get_current_history())}")
                         logger.info("=" * 80)
                         
                         # Make trading decision
@@ -653,7 +671,7 @@ class IntegratedBTCStrategy(Strategy):
                         logger.info(f"15-MIN INTERVAL REACHED: {now.strftime('%Y-%m-%d %H:%M:%S')} UTC")
                         logger.info(f"Current price: ${float(mid_price):,.4f}")
                         logger.info(f"Bid: ${float(bid_decimal):,.4f}, Ask: ${float(ask_decimal):,.4f}")
-                        logger.info(f"Price history size: {len(self.price_history)}")
+                        logger.info(f"Price history size (current instrument): {len(self._get_current_history())}")
                         logger.info("=" * 80)
                         
                         # Make trading decision
@@ -679,8 +697,9 @@ class IntegratedBTCStrategy(Strategy):
             return
         
         # Need price history
-        if len(self.price_history) < 20:
-            logger.warning(f"Not enough price history yet ({len(self.price_history)}/20)")
+        current_history = self._get_current_history()
+        if len(current_history) < 20:
+            logger.warning(f"Not enough price history yet ({len(current_history)}/20) for instrument {self.instrument_id}")
             return
         
         logger.info(f"Current price: ${float(current_price):,.4f}")
@@ -1102,11 +1121,18 @@ class IntegratedBTCStrategy(Strategy):
             traceback.print_exc()
             self.performance_tracker.increment_order_counter("rejected")
 
+    def _get_current_history(self) -> list:
+        """Return history for the current instrument only."""
+        if self.instrument_id in self.price_history_by_instrument:
+            return list(self.price_history_by_instrument[self.instrument_id])
+        return self.price_history
+
     def _estimate_volatility_pct(self) -> Optional[float]:
         """Estimate short-horizon volatility from recent mid prices."""
-        if len(self.price_history) < 20:
+        hist = self._get_current_history()
+        if len(hist) < 20:
             return None
-        window = [float(p) for p in self.price_history[-20:]]
+        window = [float(p) for p in hist[-20:]]
         returns = []
         for i in range(1, len(window)):
             prev = window[i - 1]
@@ -1135,10 +1161,12 @@ class IntegratedBTCStrategy(Strategy):
             else:
                 processed_metadata[key] = value
         
+        current_history = self._get_current_history()
+
         # Spike detection
         spike_signal = self.spike_detector.process(
             current_price=current_price,
-            historical_prices=self.price_history,
+            historical_prices=current_history,
             metadata=processed_metadata,
         )
         if spike_signal:
@@ -1148,7 +1176,7 @@ class IntegratedBTCStrategy(Strategy):
         if 'sentiment_score' in processed_metadata:
             sentiment_signal = self.sentiment_processor.process(
                 current_price=current_price,
-                historical_prices=self.price_history,
+                historical_prices=current_history,
                 metadata=processed_metadata,
             )
             if sentiment_signal:
@@ -1158,7 +1186,7 @@ class IntegratedBTCStrategy(Strategy):
         if self.enable_divergence and 'spot_price' in processed_metadata:
             divergence_signal = self.divergence_processor.process(
                 current_price=current_price,
-                historical_prices=self.price_history,
+                historical_prices=current_history,
                 metadata=processed_metadata,
             )
             if divergence_signal:
