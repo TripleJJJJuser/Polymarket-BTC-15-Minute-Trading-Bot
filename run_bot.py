@@ -200,7 +200,7 @@ class IntegratedBTCStrategy(Strategy):
         self.last_trade_time = 0
         
         # Last instrument reload time
-        self.last_reload_time = 0
+        self.last_reload_time = datetime.min.replace(tzinfo=timezone.utc)
 
         # Prevent log spam for fallback metadata warnings
         self._logged_simulation_fallback_warning = False
@@ -314,13 +314,14 @@ class IntegratedBTCStrategy(Strategy):
                 logger.debug(f"Could not get real price: {e}")
                 logger.debug("Using synthetic prices until real quotes arrive")
         
-        # Start instrument reload timer
-        self.run_in_executor(self._start_reload_timer)
-        
-        # Start Grafana if enabled
-        if self.grafana_exporter:
-            import threading
-            threading.Thread(target=self._start_grafana_sync, daemon=True).start()
+        # Start async services on the strategy event loop only
+        try:
+            loop = asyncio.get_running_loop()
+            if self.grafana_exporter:
+                loop.create_task(self._start_grafana())
+            loop.create_task(self._preload_price_history())
+        except RuntimeError:
+            logger.warning("No running event loop in on_start; async startup tasks skipped")
         
         logger.info("=" * 80)
         logger.info("Strategy active - will trade every 15 minutes")
@@ -332,15 +333,6 @@ class IntegratedBTCStrategy(Strategy):
         logger.info("=" * 80)
         logger.info("Use Ctrl+C to stop")
                 
-    def _preload_history_sync(self):
-        """Synchronous wrapper for history preload."""
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            loop.run_until_complete(self._preload_price_history())
-        finally:
-            loop.close()
-    
     async def _preload_price_history(self):
         """Pre-load price history from cache or generate synthetic data for testing."""
         logger.info("=" * 80)
@@ -439,42 +431,28 @@ class IntegratedBTCStrategy(Strategy):
         logger.info(f"Generated {needed} synthetic price points")
         logger.info(f"Now have {len(self.price_history)} total price points")
     
-    def _start_reload_timer(self):
-        """Start timer to reload instruments every 12 minutes."""
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+    def _maybe_reload_instruments(self, now: datetime) -> None:
+        """Reload instruments every 12 minutes on the strategy thread."""
+        if (now - self.last_reload_time).total_seconds() < 720:
+            return
+
+        self.last_reload_time = now
+        logger.info("=" * 80)
+        logger.info("RELOADING INSTRUMENTS (12-minute interval)")
+        logger.info("=" * 80)
+
         try:
-            loop.run_until_complete(self._reload_loop())
-        finally:
-            loop.close()
-    
-    async def _reload_loop(self):
-        """Reload instruments every 12 minutes and update to current active market."""
-        while True:
-            await asyncio.sleep(720)  # 12 minutes = 720 seconds
-            logger.info("=" * 80)
-            logger.info("RELOADING INSTRUMENTS (12-minute interval)")
-            logger.info("=" * 80)
-            
-            try:
-                # Request instrument reload from data client
-                instruments = self.cache.instruments()
-                logger.info(f"Before reload: {len(instruments)} instruments in cache")
-                
-                # Re-find BTC instrument (this will select the active one)
-                self._find_btc_instrument()
-                
-                logger.info("Instruments reloaded successfully")
-            except Exception as e:
-                logger.error(f"Failed to reload instruments: {e}")
-                
-    def _start_grafana_sync(self):
-        """Start Grafana in separate thread."""
-        import asyncio
+            instruments = self.cache.instruments()
+            logger.info(f"Before reload: {len(instruments)} instruments in cache")
+            self._find_btc_instrument()
+            logger.info("Instruments reloaded successfully")
+        except Exception as e:
+            logger.error(f"Failed to reload instruments: {e}")
+
+    async def _start_grafana(self):
+        """Start Grafana on the strategy event loop."""
         try:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            loop.run_until_complete(self.grafana_exporter.start())
+            await self.grafana_exporter.start()
             logger.info("Grafana metrics started on port 8000")
         except Exception as e:
             logger.error(f"Failed to start Grafana: {e}")
@@ -640,6 +618,7 @@ class IntegratedBTCStrategy(Strategy):
             
             # Check if we should trade
             now = datetime.now(timezone.utc)
+            self._maybe_reload_instruments(now)
             
             if self.test_mode:
                 # TEST MODE: Trade every minute at the start of each minute
@@ -844,7 +823,7 @@ class IntegratedBTCStrategy(Strategy):
         if self._external_context_cache and age < self._external_refresh_seconds:
             return self._external_context_cache
 
-        context = await asyncio.to_thread(self._fetch_external_context_sync)
+        context = self._fetch_external_context_sync()
         if context:
             self._external_context_cache = context
             self._last_external_refresh = now
@@ -1239,12 +1218,11 @@ class IntegratedBTCStrategy(Strategy):
         logger.info(f"Total paper trades recorded: {len(self.paper_trades)}")
         
         if self.grafana_exporter:
-            import asyncio
             try:
-                loop = asyncio.new_event_loop()
-                loop.run_until_complete(self.grafana_exporter.stop())
-            except:
-                pass
+                loop = asyncio.get_running_loop()
+                loop.create_task(self.grafana_exporter.stop())
+            except RuntimeError:
+                logger.warning("No running event loop in on_stop; Grafana stop skipped")
 
 
 def run_integrated_bot(simulation: bool = True, enable_grafana: bool = True, test_mode: bool = False, allow_redis_live_switch: bool = False):
