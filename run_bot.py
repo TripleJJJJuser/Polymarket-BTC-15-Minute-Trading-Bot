@@ -160,6 +160,13 @@ class IntegratedBTCStrategy(Strategy):
         self.divergence_processor = PriceDivergenceProcessor(
             divergence_threshold=0.05,
         )
+
+        divergence_env = os.getenv("ENABLE_DIVERGENCE")
+        if divergence_env is None:
+            live_guard_active = os.getenv("LIVE_TRADING_ENABLED", "").strip() == "YES_I_UNDERSTAND"
+            self.enable_divergence = simulation_mode and not live_guard_active
+        else:
+            self.enable_divergence = divergence_env.strip().lower() in {"1", "true", "yes", "on"}
         
         # Phase 4: Signal Fusion
         self.fusion_engine = get_fusion_engine()
@@ -234,6 +241,7 @@ class IntegratedBTCStrategy(Strategy):
         logger.info("  $1 per trade maximum")
         logger.info("  Reloads instruments every 12 minutes")
         logger.info(f"  Symbols: {', '.join(self.trade_symbols)}")
+        logger.info(f"  Divergence: {'enabled' if self.enable_divergence else 'disabled'}")
         logger.info("=" * 80)
     
     async def check_simulation_mode(self) -> bool:
@@ -272,6 +280,9 @@ class IntegratedBTCStrategy(Strategy):
         logger.info("=" * 80)
         logger.info("INTEGRATED BTC STRATEGY STARTED")
         logger.info("=" * 80)
+
+        if not self.enable_divergence:
+            logger.warning("Divergence disabled")
         
         # Find BTC instrument FIRST and wait for it
         self._find_btc_instrument()
@@ -1143,8 +1154,8 @@ class IntegratedBTCStrategy(Strategy):
             if sentiment_signal:
                 signals.append(sentiment_signal)
         
-        # Divergence processor (if we have spot price)
-        if 'spot_price' in processed_metadata:
+        # Divergence processor (if enabled and we have spot price)
+        if self.enable_divergence and 'spot_price' in processed_metadata:
             divergence_signal = self.divergence_processor.process(
                 current_price=current_price,
                 historical_prices=self.price_history,
