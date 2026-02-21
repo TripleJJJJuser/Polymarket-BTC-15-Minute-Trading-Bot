@@ -16,7 +16,7 @@ import math
 from decimal import Decimal
 import time
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Deque
 import random
 import json
 import urllib.request
@@ -245,6 +245,14 @@ class IntegratedBTCStrategy(Strategy):
         self.latest_ask: Optional[Decimal] = None
         self.decision_audit_file = os.getenv("DECISION_AUDIT_FILE", "decision_audit.jsonl")
         self.order_mode = os.getenv("ORDER_MODE", "smart_limit").strip().lower()
+
+        # Live order hard/soft safety caps
+        self.disable_live_orders = os.getenv("DISABLE_LIVE_ORDERS", "0").strip() == "1"
+        self.max_orders_per_hour = int(os.getenv("MAX_ORDERS_PER_HOUR", "0"))
+        self.max_daily_notional = Decimal(os.getenv("MAX_DAILY_NOTIONAL", "0"))
+        self.live_order_timestamps: Deque[datetime] = deque()
+        self.daily_notional_usd = Decimal("0")
+        self.daily_notional_date = datetime.now(timezone.utc).date()
 
         self.market_recency_weight = float(os.getenv("MARKET_RECENCY_WEIGHT", "0.6"))
         self.market_spread_weight = float(os.getenv("MARKET_SPREAD_WEIGHT", "0.4"))
@@ -1075,6 +1083,47 @@ class IntegratedBTCStrategy(Strategy):
         except Exception as e:
             logger.error(f"Failed to save paper trades: {e}")
     
+    def _reset_daily_notional_if_needed(self, now: datetime) -> None:
+        """Reset daily notional counter at UTC day boundary."""
+        current_day = now.date()
+        if current_day != self.daily_notional_date:
+            self.daily_notional_date = current_day
+            self.daily_notional_usd = Decimal("0")
+
+    def _check_live_order_limits(self, notional_usd: Decimal) -> Optional[str]:
+        """Return blocking reason when live-order safety limits are exceeded."""
+        now = datetime.now(timezone.utc)
+        self._reset_daily_notional_if_needed(now)
+
+        if self.disable_live_orders:
+            return "DISABLE_LIVE_ORDERS=1"
+
+        if self.max_orders_per_hour > 0:
+            cutoff = now - timedelta(hours=1)
+            while self.live_order_timestamps and self.live_order_timestamps[0] < cutoff:
+                self.live_order_timestamps.popleft()
+            if len(self.live_order_timestamps) >= self.max_orders_per_hour:
+                return (
+                    f"MAX_ORDERS_PER_HOUR exceeded "
+                    f"({len(self.live_order_timestamps)}/{self.max_orders_per_hour})"
+                )
+
+        if self.max_daily_notional > 0 and (self.daily_notional_usd + notional_usd) > self.max_daily_notional:
+            projected = self.daily_notional_usd + notional_usd
+            return (
+                "MAX_DAILY_NOTIONAL exceeded "
+                f"(projected=${float(projected):.2f}, limit=${float(self.max_daily_notional):.2f})"
+            )
+
+        return None
+
+    def _record_live_order_usage(self, notional_usd: Decimal) -> None:
+        """Track accepted live-order usage against hourly/daily limits."""
+        now = datetime.now(timezone.utc)
+        self._reset_daily_notional_if_needed(now)
+        self.live_order_timestamps.append(now)
+        self.daily_notional_usd += notional_usd
+
     async def _place_real_order(self, signal, position_size, current_price, direction):
         """Place REAL order using Nautilus (BUY-only: bullish->UP, bearish->DOWN)."""
         if not self.up_instrument_id or not self.down_instrument_id:
@@ -1120,6 +1169,20 @@ class IntegratedBTCStrategy(Strategy):
 
             trade_price = float(current_price)
             max_usd_amount = float(position_size)
+            requested_notional = Decimal(str(max_usd_amount))
+
+            live_order_block_reason = self._check_live_order_limits(requested_notional)
+            if live_order_block_reason:
+                logger.warning(
+                    "LIVE SAFETY: blocking real order due to limit/override: "
+                    f"{live_order_block_reason}"
+                )
+                self._audit_decision("skipped", {
+                    "reason": "live_order_blocked",
+                    "detail": live_order_block_reason,
+                    "requested_notional_usd": float(requested_notional),
+                })
+                return
 
             timestamp_ms = int(time.time() * 1000)
             unique_id = f"{self.selected_symbol}-15MIN-{direction.upper()}-${max_usd_amount:.0f}-{timestamp_ms}"
@@ -1182,6 +1245,8 @@ class IntegratedBTCStrategy(Strategy):
             logger.info(f"  Estimated Cost: ~${max_usd_amount:.2f}")
             logger.info(f"  Price: ${trade_price:.4f}")
             logger.info("=" * 80)
+
+            self._record_live_order_usage(requested_notional)
 
             self.performance_tracker.increment_order_counter("placed")
 
