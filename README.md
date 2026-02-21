@@ -344,3 +344,9 @@ If you find this project useful, please star the GitHub repo! It helps others di
 ## contact me on telegram 
  [![Telegram](https://img.shields.io/badge/Telegram-%230088cc.svg?style=for-the-badge&logo=telegram&logoColor=white)](https://t.me/Bigg_O7)
 
+
+
+### Replay/backtest harness
+```bash
+python scripts/replay_backtest.py --csv your_trades.csv --min-expectancy 0 --max-drawdown 5 --min-precision 0.5
+```

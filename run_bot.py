@@ -722,10 +722,19 @@ class IntegratedBTCStrategy(Strategy):
                     return
 
         # Phase 5: Calculate position size (with $1 cap)
+        spread_pct_for_sizing = None
+        if self.latest_bid is not None and self.latest_ask is not None:
+            mid_for_sizing = (self.latest_bid + self.latest_ask) / 2
+            if mid_for_sizing > 0:
+                spread_pct_for_sizing = float((self.latest_ask - self.latest_bid) / mid_for_sizing)
+
         position_size = self.risk_engine.calculate_position_size(
             signal_confidence=fused.confidence,
             signal_score=fused.score,
             current_price=current_price,  # Pass Decimal to risk engine
+            symbol=self.selected_symbol,
+            spread_pct=spread_pct_for_sizing,
+            volatility_pct=self._estimate_volatility_pct(),
         )
 
         logger.info(f"Calculated position size: ${float(position_size):.2f}")
@@ -736,6 +745,7 @@ class IntegratedBTCStrategy(Strategy):
             size=position_size,
             direction=direction,
             current_price=current_price,
+            symbol=self.selected_symbol,
         )
 
         if not is_valid:
@@ -891,6 +901,7 @@ class IntegratedBTCStrategy(Strategy):
         
         # Determine outcome
         outcome = "WIN" if pnl > 0 else "LOSS"
+        self.risk_engine.register_trade_result(pnl)
         
         # Create paper trade record with outcome
         paper_trade = PaperTrade(
@@ -1067,6 +1078,23 @@ class IntegratedBTCStrategy(Strategy):
             traceback.print_exc()
             self.performance_tracker.increment_order_counter("rejected")
     
+    def _estimate_volatility_pct(self) -> Optional[float]:
+        """Estimate short-horizon volatility from recent mid prices."""
+        if len(self.price_history) < 20:
+            return None
+        window = [float(p) for p in self.price_history[-20:]]
+        returns = []
+        for i in range(1, len(window)):
+            prev = window[i - 1]
+            if prev <= 0:
+                continue
+            returns.append((window[i] - prev) / prev)
+        if not returns:
+            return None
+        mean_r = sum(returns) / len(returns)
+        var = sum((r - mean_r) ** 2 for r in returns) / len(returns)
+        return var ** 0.5
+
     def _process_signals(self, current_price, metadata=None):
         """Process all signal processors."""
         signals = []
@@ -1125,6 +1153,10 @@ class IntegratedBTCStrategy(Strategy):
             }
             with open(self.decision_audit_file, "a") as f:
                 f.write(json.dumps(event) + "\n")
+
+            if status == "skipped" and self.grafana_exporter:
+                reason = str(payload.get("reason", "unknown"))
+                self.grafana_exporter.increment_skip_reason(reason)
         except Exception as e:
             logger.debug(f"Decision audit write failed: {e}")
 

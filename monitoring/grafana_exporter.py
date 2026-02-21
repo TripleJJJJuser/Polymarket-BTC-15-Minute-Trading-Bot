@@ -304,6 +304,12 @@ class GrafanaMetricsExporter:
             'trading_orders_rejected',
             'Total orders rejected'
         )
+
+        self.trade_skips = Counter(
+            'trading_trade_skips_total',
+            'Total skipped trade decisions by reason',
+            ['reason']
+        )
         
         logger.info("Prometheus metrics initialized")
     
@@ -435,6 +441,11 @@ class GrafanaMetricsExporter:
             self.orders_filled.inc()
         elif status == "rejected":
             self.orders_rejected.inc()
+
+    def increment_skip_reason(self, reason: str) -> None:
+        """Increment skip counter by reason for Grafana panels."""
+        self.trade_skips.labels(reason=reason).inc()
+
 
 
 # Singleton instance

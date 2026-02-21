@@ -3,11 +3,12 @@ Risk Engine
 Manages position sizing, risk limits, and portfolio constraints
 """
 from decimal import Decimal
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List
 from dataclasses import dataclass
 from enum import Enum
 from loguru import logger
+import os
 
 
 class RiskLevel(Enum):
@@ -86,6 +87,22 @@ class RiskEngine:
         
         # Alerts
         self._alerts: List[Dict[str, Any]] = []
+
+        # Symbol-specific position caps (env: SYMBOL_MAX_POSITION_USD_JSON)
+        self._symbol_max_position: Dict[str, Decimal] = {}
+        symbol_caps_raw = os.getenv("SYMBOL_MAX_POSITION_USD_JSON", '{"BTC":1.0,"ETH":0.9,"SOL":0.7,"XRP":0.6}')
+        try:
+            import json
+            parsed = json.loads(symbol_caps_raw)
+            self._symbol_max_position = {k.upper(): Decimal(str(v)) for k, v in parsed.items()}
+        except Exception:
+            self._symbol_max_position = {}
+
+        # Consecutive-loss cooldown
+        self._consecutive_losses = 0
+        self._max_consecutive_losses = int(os.getenv("MAX_CONSECUTIVE_LOSSES", "3"))
+        self._cooldown_minutes = int(os.getenv("RISK_COOLDOWN_MINUTES", "60"))
+        self._cooldown_until: Optional[datetime] = None
         
         logger.info(
             f"Initialized Risk Engine: "
@@ -98,6 +115,7 @@ class RiskEngine:
         size: Decimal,
         direction: str,
         current_price: Decimal,
+        symbol: str = "BTC",
     ) -> tuple[bool, Optional[str]]:
         """
         Validate if new position is allowed.
@@ -110,9 +128,16 @@ class RiskEngine:
         Returns:
             (is_valid, error_message)
         """
+        if self._cooldown_until and datetime.now() < self._cooldown_until:
+            return False, f"Risk cooldown active until {self._cooldown_until.isoformat()}"
+
         # Check position size limit ($1 max)
         if size > self.limits.max_position_size:
             return False, f"Position size ${size} exceeds max ${self.limits.max_position_size}"
+
+        symbol_cap = self._symbol_max_position.get(symbol.upper())
+        if symbol_cap is not None and size > symbol_cap:
+            return False, f"Position size ${size} exceeds {symbol.upper()} cap ${symbol_cap}"
         
         # Check max positions
         if len(self._positions) >= self.limits.max_positions:
@@ -144,6 +169,9 @@ class RiskEngine:
         signal_score: float,
         current_price: Decimal,
         risk_percent: float = 0.02,
+        symbol: str = "BTC",
+        spread_pct: Optional[float] = None,
+        volatility_pct: Optional[float] = None,
     ) -> Decimal:
         """
         Calculate optimal position size with $1 cap.
@@ -165,7 +193,20 @@ class RiskEngine:
         
         # Calculate position size
         position_size = risk_amount * strength_multiplier
-        
+
+        # Volatility/spread-aware scaling
+        if spread_pct is not None:
+            spread_scale = max(0.20, 1.0 - min(spread_pct, 0.20) / 0.20)
+            position_size *= Decimal(str(spread_scale))
+        if volatility_pct is not None:
+            vol_scale = max(0.20, 1.0 - min(volatility_pct, 0.30) / 0.30)
+            position_size *= Decimal(str(vol_scale))
+
+        # Per-symbol cap
+        symbol_cap = self._symbol_max_position.get(symbol.upper())
+        if symbol_cap is not None and position_size > symbol_cap:
+            position_size = symbol_cap
+
         # ENFORCE $1 MAXIMUM
         if position_size > Decimal("1.0"):
             logger.info(f"Capping position size from ${float(position_size):.2f} to $1.00")
@@ -375,6 +416,20 @@ class RiskEngine:
         
         logger.warning(f"[{risk_level.value.upper()}] {alert_type}: {message}")
     
+    def register_trade_result(self, pnl: Decimal) -> None:
+        """Track consecutive losses and trigger risk cooldown."""
+        if pnl < 0:
+            self._consecutive_losses += 1
+            if self._consecutive_losses >= self._max_consecutive_losses:
+                self._cooldown_until = datetime.now() + timedelta(minutes=self._cooldown_minutes)
+                self._create_alert(
+                    "RISK_COOLDOWN",
+                    f"Triggered cooldown for {self._cooldown_minutes}m after {self._consecutive_losses} consecutive losses",
+                    RiskLevel.HIGH,
+                )
+        else:
+            self._consecutive_losses = 0
+
     def get_total_exposure(self) -> Decimal:
         """Get total current exposure across all positions."""
         return sum(pos.current_size for pos in self._positions.values())
@@ -418,6 +473,8 @@ class RiskEngine:
             "daily_stats": {
                 "trades": self._daily_trades,
                 "pnl": float(self._daily_pnl),
+                "consecutive_losses": self._consecutive_losses,
+                "cooldown_until": self._cooldown_until.isoformat() if self._cooldown_until else None,
             },
             "alerts": len([a for a in self._alerts if (datetime.now() - a["timestamp"]).seconds < 3600]),
         }
