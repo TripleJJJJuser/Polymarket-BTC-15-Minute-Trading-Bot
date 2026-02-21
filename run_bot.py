@@ -141,6 +141,9 @@ class IntegratedBTCStrategy(Strategy):
         
         # Nautilus
         self.instrument_id = None
+        self.current_condition_id = None
+        self.up_instrument_id = None
+        self.down_instrument_id = None
         self.redis_client = redis_client
         self.current_simulation_mode = simulation_mode
         self.allow_redis_live_switch = allow_redis_live_switch
@@ -457,131 +460,165 @@ class IntegratedBTCStrategy(Strategy):
         except Exception as e:
             logger.error(f"Failed to start Grafana: {e}")
     
+    def _classify_market_outcome(self, instrument) -> Optional[str]:
+        """Classify an instrument outcome as up/down from metadata hints."""
+        info = instrument.info if hasattr(instrument, "info") and instrument.info else {}
+        outcome_index = info.get("outcome_index")
+        try:
+            if outcome_index is not None:
+                idx = int(outcome_index)
+                if idx == 0:
+                    return "up"
+                if idx == 1:
+                    return "down"
+        except (TypeError, ValueError):
+            pass
+
+        text = " ".join(
+            str(info.get(k, ""))
+            for k in ("outcome", "name", "title", "question", "description")
+        ).lower()
+
+        up_markers = ("yes", "up", "above", "higher", "rise", "bull")
+        down_markers = ("no", "down", "below", "lower", "fall", "bear")
+
+        if any(marker in text for marker in up_markers):
+            return "up"
+        if any(marker in text for marker in down_markers):
+            return "down"
+        return None
+
     def _find_btc_instrument(self):
-        """Find the current active 15-min instrument for configured symbols."""
+        """Find and pair UP/DOWN outcome tokens for the active 15-min market by condition_id."""
         instruments = self.cache.instruments()
         logger.info(f"Checking {len(instruments)} loaded instruments...")
-        
+
         if not instruments:
             logger.error("NO INSTRUMENTS LOADED!")
             return
-        
-        # Get current UTC time
+
         now = datetime.now(timezone.utc)
         current_timestamp = int(now.timestamp())
-        
-        btc_instruments = []
-        
+
+        markets_by_condition = {}
+
         for instrument in instruments:
             try:
-                if hasattr(instrument, 'info') and instrument.info:
-                    question = instrument.info.get('question', '').lower()
-                    slug = instrument.info.get('market_slug', '').lower()
-                    
-                    if any(sym.lower() in question or sym.lower() in slug for sym in self.trade_symbols) and '15m' in slug:
-                        # Extract timestamp from slug
-                        try:
-                            timestamp_part = slug.split('-')[-1]
-                            market_timestamp = int(timestamp_part)
-                            
-                            # Get end time from instrument
-                            end_date = instrument.info.get('end_date_iso')
-                            end_timestamp = None
-                            if end_date:
-                                end_dt = datetime.fromisoformat(end_date.replace('Z', '+00:00'))
-                                end_timestamp = int(end_dt.timestamp())
-                            
-                            # Calculate time difference
-                            time_diff = market_timestamp - current_timestamp
-                            
-                            quote = self.cache.quote_tick(instrument.id)
-                            spread_pct = None
-                            has_quote = False
-                            if quote and quote.bid_price and quote.ask_price:
-                                bid = quote.bid_price.as_decimal()
-                                ask = quote.ask_price.as_decimal()
-                                mid = (bid + ask) / 2
-                                if mid > 0:
-                                    spread_pct = float((ask - bid) / mid)
-                                has_quote = True
+                if not hasattr(instrument, "info") or not instrument.info:
+                    continue
 
-                            btc_instruments.append({
-                                'instrument': instrument,
-                                'slug': slug,
-                                'market_timestamp': market_timestamp,
-                                'end_timestamp': end_timestamp,
-                                'question': question,
-                                'symbol': next((sym for sym in self.trade_symbols if sym.lower() in question or sym.lower() in slug), self.selected_symbol),
-                                'active': instrument.info.get('active', False),
-                                'closed': instrument.info.get('closed', True),
-                                'time_diff_minutes': time_diff / 60,  # Minutes from now
-                                'has_quote': has_quote,
-                                'spread_pct': spread_pct,
-                            })
-                            
-                        except (ValueError, IndexError):
-                            continue
-            
+                info = instrument.info
+                question = str(info.get("question", "")).lower()
+                slug = str(info.get("market_slug", "")).lower()
+
+                if not (any(sym.lower() in question or sym.lower() in slug for sym in self.trade_symbols) and "15m" in slug):
+                    continue
+
+                condition_id = info.get("condition_id")
+                if not condition_id:
+                    continue
+
+                try:
+                    market_timestamp = int(slug.split("-")[-1])
+                except (ValueError, IndexError):
+                    continue
+
+                record = markets_by_condition.get(condition_id)
+                if record is None:
+                    end_timestamp = None
+                    end_date = info.get("end_date_iso")
+                    if end_date:
+                        end_dt = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
+                        end_timestamp = int(end_dt.timestamp())
+
+                    time_diff = market_timestamp - current_timestamp
+                    record = {
+                        "condition_id": condition_id,
+                        "slug": slug,
+                        "question": question,
+                        "market_timestamp": market_timestamp,
+                        "end_timestamp": end_timestamp,
+                        "time_diff_minutes": time_diff / 60,
+                        "symbol": next((sym for sym in self.trade_symbols if sym.lower() in question or sym.lower() in slug), self.selected_symbol),
+                        "tokens": {"up": None, "down": None},
+                        "best_spread_pct": None,
+                        "has_quote": False,
+                    }
+                    markets_by_condition[condition_id] = record
+
+                side = self._classify_market_outcome(instrument)
+                if side in ("up", "down") and record["tokens"][side] is None:
+                    record["tokens"][side] = instrument.id
+
+                quote = self.cache.quote_tick(instrument.id)
+                if quote and quote.bid_price and quote.ask_price:
+                    bid = quote.bid_price.as_decimal()
+                    ask = quote.ask_price.as_decimal()
+                    mid = (bid + ask) / 2
+                    if mid > 0:
+                        spread_pct = float((ask - bid) / mid)
+                        best = record["best_spread_pct"]
+                        record["best_spread_pct"] = spread_pct if best is None else min(best, spread_pct)
+                    record["has_quote"] = True
             except Exception:
                 continue
-        
-        if not btc_instruments:
-            logger.error("NO 15-MIN INSTRUMENTS FOUND FOR CONFIGURED SYMBOLS!")
-            return
-        
-        # Sort by how close they are to current time (positive means future)
-        # We want the one that started most recently (smallest positive time_diff)
-        current_markets = [i for i in btc_instruments if i['time_diff_minutes'] <= 0 and i['time_diff_minutes'] > -15]
-        future_markets = [i for i in btc_instruments if i['time_diff_minutes'] > 0]
-        
-        logger.info("=" * 80)
-        logger.info("TARGET 15-MIN INSTRUMENTS:")
-        for i in btc_instruments:
-            status = "CURRENT" if i in current_markets else "FUTURE" if i['time_diff_minutes'] > 0 else "PAST"
-            logger.info(f"  {i['slug']}: {status} (starts in {i['time_diff_minutes']:.1f} min)")
-        logger.info("=" * 80)
-        
-        candidates = current_markets if current_markets else future_markets
-        if not candidates:
-            logger.error("No current/future 15m candidates available")
+
+        paired_markets = [m for m in markets_by_condition.values() if m["tokens"]["up"] and m["tokens"]["down"]]
+        if not paired_markets:
+            logger.error("NO PAIRED 15-MIN MARKETS FOUND (missing UP/DOWN token mapping)")
             return
 
-        # Rank candidates by recency and execution quality (spread + quote availability)
+        current_markets = [m for m in paired_markets if m["time_diff_minutes"] <= 0 and m["time_diff_minutes"] > -15]
+        future_markets = [m for m in paired_markets if m["time_diff_minutes"] > 0]
+
+        logger.info("=" * 80)
+        logger.info("TARGET 15-MIN MARKET CONDITIONS:")
+        for m in paired_markets:
+            status = "CURRENT" if m in current_markets else "FUTURE" if m["time_diff_minutes"] > 0 else "PAST"
+            logger.info(f"  {m['slug']} [{m['condition_id']}]: {status} (starts in {m['time_diff_minutes']:.1f} min)")
+        logger.info("=" * 80)
+
+        candidates = current_markets if current_markets else future_markets
+        if not candidates:
+            logger.error("No current/future 15m market conditions available")
+            return
+
         for c in candidates:
-            recency_score = max(0.0, 1.0 - (abs(c['time_diff_minutes']) / 15.0))
+            recency_score = max(0.0, 1.0 - (abs(c["time_diff_minutes"]) / 15.0))
             spread_score = 0.0
-            if c.get('spread_pct') is not None:
-                spread_score = max(0.0, 1.0 - (c['spread_pct'] / max(self.max_spread_pct, 1e-6)))
-            quote_bonus = 0.25 if c.get('has_quote') else 0.0
-            c['selection_score'] = (
+            spread_pct = c.get("best_spread_pct")
+            if spread_pct is not None:
+                spread_score = max(0.0, 1.0 - (spread_pct / max(self.max_spread_pct, 1e-6)))
+            quote_bonus = 0.25 if c.get("has_quote") else 0.0
+            c["selection_score"] = (
                 self.market_recency_weight * recency_score
                 + self.market_spread_weight * spread_score
                 + quote_bonus
             )
 
-        candidates.sort(key=lambda x: x.get('selection_score', 0.0), reverse=True)
+        candidates.sort(key=lambda x: x.get("selection_score", 0.0), reverse=True)
         selected = candidates[0]
 
-        if current_markets:
-            logger.info(
-                f"✓ SELECTED CURRENT market: {selected['slug']} ({selected['symbol']}) "
-                f"score={selected.get('selection_score', 0.0):.3f}"
-            )
-        else:
-            logger.info(
-                f"⚠ No current market, selecting next: {selected['slug']} ({selected['symbol']}) "
-                f"(starts in {selected['time_diff_minutes']:.1f} min, score={selected.get('selection_score', 0.0):.3f})"
-            )
+        self.selected_symbol = selected.get("symbol", self.selected_symbol)
+        self.current_condition_id = selected["condition_id"]
+        self.up_instrument_id = selected["tokens"]["up"]
+        self.down_instrument_id = selected["tokens"]["down"]
 
-        self.selected_symbol = selected.get('symbol', self.selected_symbol)
-        new_instrument_id = selected['instrument'].id
+        new_instrument_id = self.up_instrument_id
         if self.instrument_id != new_instrument_id:
             logger.debug(f"Switching instrument history: {self.instrument_id} -> {new_instrument_id}")
             self.price_history_by_instrument[new_instrument_id] = deque(maxlen=self.max_history)
         self.instrument_id = new_instrument_id
         self.price_history = list(self._get_current_history())
-        self.subscribe_quote_ticks(self.instrument_id)
-                        
+
+        self.subscribe_quote_ticks(self.up_instrument_id)
+        self.subscribe_quote_ticks(self.down_instrument_id)
+
+        logger.info(
+            f"Selected condition {self.current_condition_id} ({self.selected_symbol}) "
+            f"UP={self.up_instrument_id} DOWN={self.down_instrument_id}"
+        )
+
     def on_quote_tick(self, tick: QuoteTick):
         """Handle quote tick updates."""
         try:
@@ -596,11 +633,12 @@ class IntegratedBTCStrategy(Strategy):
             
             # Calculate mid price
             mid_price = (bid_decimal + ask_decimal) / 2
-            self.latest_bid = bid_decimal
-            self.latest_ask = ask_decimal
-            
+
             # Update per-instrument price history
             inst_id = getattr(tick, "instrument_id", self.instrument_id)
+            if inst_id == self.instrument_id:
+                self.latest_bid = bid_decimal
+                self.latest_ask = ask_decimal
             if inst_id not in self.price_history_by_instrument:
                 self.price_history_by_instrument[inst_id] = deque(maxlen=self.max_history)
             self.price_history_by_instrument[inst_id].append(mid_price)
@@ -963,9 +1001,9 @@ class IntegratedBTCStrategy(Strategy):
             logger.error(f"Failed to save paper trades: {e}")
     
     async def _place_real_order(self, signal, position_size, current_price, direction):
-        """Place REAL order using Nautilus."""
-        if not self.instrument_id:
-            logger.error("No instrument available")
+        """Place REAL order using Nautilus (BUY-only: bullish->UP, bearish->DOWN)."""
+        if not self.up_instrument_id or not self.down_instrument_id:
+            logger.error("No paired UP/DOWN instruments available")
             return
 
         try:
@@ -973,44 +1011,32 @@ class IntegratedBTCStrategy(Strategy):
             logger.info("LIVE MODE - PLACING REAL ORDER!")
             logger.info("=" * 80)
 
-            # Determine side/instrument: bullish buy YES, bearish buy NO when available
             side = OrderSide.BUY
-            target_instrument_id = self.instrument_id
-            if direction == "short":
-                try:
-                    current_inst = self.cache.instrument(self.instrument_id)
-                    current_info = current_inst.info if current_inst and hasattr(current_inst, 'info') else {}
-                    current_condition = (current_info or {}).get('condition_id')
-                    if current_condition:
-                        for inst in self.cache.instruments():
-                            info = inst.info if hasattr(inst, 'info') else None
-                            if not info or info.get('condition_id') != current_condition:
-                                continue
-                            side_hint = str(info.get('outcome') or info.get('name') or info.get('title') or '').lower()
-                            if 'no' in side_hint or 'down' in side_hint:
-                                target_instrument_id = inst.id
-                                break
-                except Exception:
-                    pass
+            target_instrument_id = self.up_instrument_id if direction == "long" else self.down_instrument_id
 
-            # Get instrument after target has been finalized
             instrument = self.cache.instrument(target_instrument_id)
             if not instrument:
                 logger.error("Instrument not in cache")
                 return
 
-            # Slippage guard based on current top-of-book
-            if self.latest_bid is not None and self.latest_ask is not None:
-                mid = (self.latest_bid + self.latest_ask) / 2
-                exec_ref = self.latest_ask if side == OrderSide.BUY else self.latest_bid
+            quote = self.cache.quote_tick(target_instrument_id)
+            ref_bid = self.latest_bid
+            ref_ask = self.latest_ask
+            if quote and quote.bid_price and quote.ask_price:
+                ref_bid = quote.bid_price.as_decimal()
+                ref_ask = quote.ask_price.as_decimal()
+
+            if ref_bid is not None and ref_ask is not None:
+                mid = (ref_bid + ref_ask) / 2
                 if mid > 0:
-                    slippage_pct = float(abs(exec_ref - mid) / mid)
+                    slippage_pct = float(abs(ref_ask - mid) / mid)
                     if slippage_pct > self.max_slippage_pct:
                         self._audit_decision("skipped", {
                             "reason": "slippage_too_high",
                             "slippage_pct": slippage_pct,
                             "max_slippage_pct": self.max_slippage_pct,
                             "side": side.name,
+                            "target_instrument_id": str(target_instrument_id),
                         })
                         logger.warning(
                             f"Skipping real order: expected slippage {slippage_pct:.2%} exceeds max {self.max_slippage_pct:.2%}"
@@ -1020,44 +1046,31 @@ class IntegratedBTCStrategy(Strategy):
             trade_price = float(current_price)
             max_usd_amount = float(position_size)
 
-            # Create unique order ID
             timestamp_ms = int(time.time() * 1000)
-            unique_id = f"{self.selected_symbol}-15MIN-${max_usd_amount:.0f}-{timestamp_ms}"
+            unique_id = f"{self.selected_symbol}-15MIN-{direction.upper()}-${max_usd_amount:.0f}-{timestamp_ms}"
 
             if self.order_mode == "market":
-                # SAFE MARKET SEMANTICS:
-                # BUY => quote notional (USDC) with quote_quantity=True
-                # SELL => disallowed unless base quantity is explicitly known
-                if side == OrderSide.BUY:
-                    quote_precision = max(2, getattr(instrument, "size_precision", 2))
-                    quote_notional = max(max_usd_amount, 0.01)
-                    qty = Quantity(quote_notional, precision=quote_precision)
+                quote_precision = max(2, getattr(instrument, "size_precision", 2))
+                quote_notional = max(max_usd_amount, 0.01)
+                qty = Quantity(quote_notional, precision=quote_precision)
 
-                    order = self.order_factory.market(
-                        instrument_id=target_instrument_id,
-                        order_side=side,
-                        quantity=qty,
-                        client_order_id=ClientOrderId(unique_id),
-                        quote_quantity=True,
-                        time_in_force=TimeInForce.IOC,
-                    )
-                    self.submit_order(order)
-                    logger.info("REAL MARKET BUY ORDER SUBMITTED!")
-                    logger.info(f"  quote_quantity=True, qty(USDC)={quote_notional:.2f}")
-                else:
-                    logger.error("Market SELL is disabled for safety unless base token quantity is explicitly known")
-                    return
+                order = self.order_factory.market(
+                    instrument_id=target_instrument_id,
+                    order_side=side,
+                    quantity=qty,
+                    client_order_id=ClientOrderId(unique_id),
+                    quote_quantity=True,
+                    time_in_force=TimeInForce.IOC,
+                )
+                self.submit_order(order)
+                logger.info("REAL MARKET BUY ORDER SUBMITTED!")
+                logger.info(f"  quote_quantity=True, qty(USDC)={quote_notional:.2f}")
             else:
-                # Always use IOC limit for safer execution
                 limit_price = current_price
-                if self.latest_bid is not None and self.latest_ask is not None:
-                    mid = (self.latest_bid + self.latest_ask) / 2
-                    if side == OrderSide.BUY:
-                        cap = mid * (Decimal("1") + Decimal(str(self.max_slippage_pct)))
-                        limit_price = min(self.latest_ask, cap)
-                    else:
-                        floor = mid * (Decimal("1") - Decimal(str(self.max_slippage_pct)))
-                        limit_price = max(self.latest_bid, floor)
+                if ref_bid is not None and ref_ask is not None:
+                    mid = (ref_bid + ref_ask) / 2
+                    cap = mid * (Decimal("1") + Decimal(str(self.max_slippage_pct)))
+                    limit_price = min(ref_ask, cap)
 
                 if trade_price > 0:
                     token_qty = max_usd_amount / trade_price
@@ -1081,17 +1094,20 @@ class IntegratedBTCStrategy(Strategy):
                     time_in_force=TimeInForce.IOC,
                 )
                 self.submit_order(order)
-                logger.info(f"REAL SMART LIMIT ORDER SUBMITTED @ {float(limit_price):.4f}!")
+                logger.info(f"REAL SMART LIMIT BUY ORDER SUBMITTED @ {float(limit_price):.4f}!")
                 logger.info(f"  quote_quantity=False, qty(tokens)={token_qty:.6f}")
 
             logger.info(f"  Order ID: {unique_id}")
+            logger.info(f"  Signal Direction: {direction}")
             logger.info(f"  Side: {side.name}")
-            logger.info(f"  Instrument: {target_instrument_id}")
+            logger.info(f"  Condition ID: {self.current_condition_id}")
+            logger.info(f"  UP Instrument: {self.up_instrument_id}")
+            logger.info(f"  DOWN Instrument: {self.down_instrument_id}")
+            logger.info(f"  Target Instrument: {target_instrument_id}")
             logger.info(f"  Estimated Cost: ~${max_usd_amount:.2f}")
             logger.info(f"  Price: ${trade_price:.4f}")
             logger.info("=" * 80)
 
-            # Track order in performance tracker
             self.performance_tracker.increment_order_counter("placed")
 
         except Exception as e:
