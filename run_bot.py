@@ -578,7 +578,10 @@ class IntegratedBTCStrategy(Strategy):
             )
 
         self.selected_symbol = selected.get('symbol', self.selected_symbol)
-        self.instrument_id = selected['instrument'].id
+        new_instrument_id = selected['instrument'].id
+        if self.instrument_id != new_instrument_id:
+            self.price_history = []
+        self.instrument_id = new_instrument_id
         self.subscribe_quote_ticks(self.instrument_id)
                         
     def on_quote_tick(self, tick: QuoteTick):
@@ -625,7 +628,7 @@ class IntegratedBTCStrategy(Strategy):
                         logger.info("=" * 80)
                         
                         # Make trading decision
-                        self.run_in_executor(lambda: self._make_trading_decision_sync(float(mid_price)))
+                        asyncio.create_task(self._make_trading_decision(Decimal(str(float(mid_price)))))
             else:
                 # NORMAL MODE: Trade every 15 minutes
                 seconds_since_interval = now.timestamp() % 900
@@ -643,26 +646,12 @@ class IntegratedBTCStrategy(Strategy):
                         logger.info("=" * 80)
                         
                         # Make trading decision
-                        self.run_in_executor(lambda: self._make_trading_decision_sync(float(mid_price)))
+                        asyncio.create_task(self._make_trading_decision(Decimal(str(float(mid_price)))))
         
         except Exception as e:
             logger.error(f"Error processing quote tick: {e}")
             import traceback
             traceback.print_exc()
-                                            
-    def _make_trading_decision_sync(self, current_price):
-        """Synchronous wrapper for trading decision (called from executor)."""
-        # Convert float back to Decimal for processing
-        from decimal import Decimal
-        price_decimal = Decimal(str(current_price))
-        
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            loop.run_until_complete(self._make_trading_decision(price_decimal))
-        finally:
-            loop.close()
-            
     async def _make_trading_decision(self, current_price):
         """Make trading decision using our 7-phase system."""
         
@@ -884,11 +873,8 @@ class IntegratedBTCStrategy(Strategy):
         
         exit_time = datetime.now(timezone.utc) + exit_delta
         
-        # Simulate price movement based on signal direction
-        if "BULLISH" in str(signal.direction):
-            movement = random.uniform(-0.02, 0.08)  # -2% to +8%
-        else:
-            movement = random.uniform(-0.08, 0.02)  # -8% to +2%
+        # Unbiased simulation movement (avoid direction-tied optimism)
+        movement = random.uniform(-0.05, 0.05)
         
         exit_price = current_price * (Decimal("1.0") + Decimal(str(movement)))
         exit_price = max(Decimal("0.01"), min(Decimal("0.99"), exit_price))
@@ -975,7 +961,7 @@ class IntegratedBTCStrategy(Strategy):
         
         try:
             # Get instrument
-            instrument = self.cache.instrument(self.instrument_id)
+            instrument = self.cache.instrument(target_instrument_id)
             if not instrument:
                 logger.error("Instrument not in cache")
                 return
@@ -984,8 +970,27 @@ class IntegratedBTCStrategy(Strategy):
             logger.info("LIVE MODE - PLACING REAL ORDER!")
             logger.info("=" * 80)
             
-            # Determine side
-            side = OrderSide.BUY if direction == "long" else OrderSide.SELL
+            # Determine side/instrument: bullish buy YES, bearish buy NO when available
+            side = OrderSide.BUY
+            target_instrument_id = self.instrument_id
+            if direction == "short":
+                try:
+                    current_inst = self.cache.instrument(self.instrument_id)
+                    current_info = current_inst.info if current_inst and hasattr(current_inst, 'info') else {}
+                    current_condition = (current_info or {}).get('condition_id')
+                    if current_condition:
+                        for inst in self.cache.instruments():
+                            info = inst.info if hasattr(inst, 'info') else None
+                            if not info:
+                                continue
+                            if info.get('condition_id') != current_condition:
+                                continue
+                            side_hint = str(info.get('outcome') or info.get('name') or info.get('title') or '').lower()
+                            if 'no' in side_hint or 'down' in side_hint:
+                                target_instrument_id = inst.id
+                                break
+                except Exception:
+                    pass
 
             # Slippage guard based on current top-of-book
             if self.latest_bid is not None and self.latest_ask is not None:
@@ -1030,19 +1035,11 @@ class IntegratedBTCStrategy(Strategy):
             unique_id = f"{self.selected_symbol}-15MIN-${max_usd_amount:.0f}-{timestamp_ms}"
             
             if self.order_mode == "market":
-                order = self.order_factory.market(
-                    instrument_id=self.instrument_id,
-                    order_side=side,
-                    quantity=qty,
-                    client_order_id=ClientOrderId(unique_id),
-                    quote_quantity=False,
-                    time_in_force=TimeInForce.IOC,
-                )
-                self.submit_order(order)
-                logger.info("REAL MARKET ORDER SUBMITTED!")
-            else:
-                limit_price = current_price
-                if self.latest_bid is not None and self.latest_ask is not None:
+                logger.warning("ORDER_MODE=market overridden to smart_limit for live safety")
+
+            # Always use IOC limit for safer execution
+            limit_price = current_price
+            if self.latest_bid is not None and self.latest_ask is not None:
                     mid = (self.latest_bid + self.latest_ask) / 2
                     if side == OrderSide.BUY:
                         cap = mid * (Decimal("1") + Decimal(str(self.max_slippage_pct)))
@@ -1051,8 +1048,8 @@ class IntegratedBTCStrategy(Strategy):
                         floor = mid * (Decimal("1") - Decimal(str(self.max_slippage_pct)))
                         limit_price = max(self.latest_bid, floor)
 
-                order = self.order_factory.limit(
-                    instrument_id=self.instrument_id,
+            order = self.order_factory.limit(
+                    instrument_id=target_instrument_id,
                     order_side=side,
                     quantity=qty,
                     price=Price.from_str(f"{float(limit_price):.4f}"),
@@ -1060,8 +1057,8 @@ class IntegratedBTCStrategy(Strategy):
                     quote_quantity=False,
                     time_in_force=TimeInForce.IOC,
                 )
-                self.submit_order(order)
-                logger.info(f"REAL SMART LIMIT ORDER SUBMITTED @ {float(limit_price):.4f}!")
+            self.submit_order(order)
+            logger.info(f"REAL SMART LIMIT ORDER SUBMITTED @ {float(limit_price):.4f}!")
             logger.info(f"  Order ID: {unique_id}")
             logger.info(f"  Side: {side.name}")
             logger.info(f"  Token Quantity: {token_qty:.6f}")

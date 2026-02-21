@@ -104,6 +104,8 @@ source venv/bin/activate
 ```
 bash
 pip install -r requirements.txt
+# or install as package
+pip install -e .
 ```
 ## 4. Configure Environment Variables
 ```
@@ -350,3 +352,6 @@ If you find this project useful, please star the GitHub repo! It helps others di
 ```bash
 python scripts/replay_backtest.py --csv your_trades.csv --min-expectancy 0 --max-drawdown 5 --min-precision 0.5
 ```
+
+
+> Note: `ORDER_MODE=market` is force-overridden to IOC limit for live safety in current build.
