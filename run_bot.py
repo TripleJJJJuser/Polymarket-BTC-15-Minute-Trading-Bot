@@ -381,13 +381,13 @@ class IntegratedBTCStrategy(Strategy):
             self.price_history.append(current_price)
             logger.info(f"Current price from cache: ${float(current_price):.4f}")
         
-        # Try to get historical quotes from cache
-        # Note: This depends on your data provider storing history
+        # Try to get historical quotes from cache (if provider returns a sequence)
         quotes = self.cache.quote_tick(self.instrument_id)
-        if quotes and len(quotes) > 0:
+        if isinstance(quotes, (list, tuple)) and quotes:
             for quote in quotes[-20:]:  # Take last 20 quotes
-                mid_price = (quote.bid_price + quote.ask_price) / 2
-                self.price_history.append(mid_price)
+                if quote and quote.bid_price and quote.ask_price:
+                    mid_price = (quote.bid_price + quote.ask_price) / 2
+                    self.price_history.append(mid_price)
             logger.info(f"Loaded {len(quotes)} historical quotes from cache")
         
         # Remove duplicates while preserving order
@@ -724,10 +724,9 @@ class IntegratedBTCStrategy(Strategy):
                         # Make trading decision
                         asyncio.create_task(self._make_trading_decision(Decimal(str(float(mid_price)))))
         
-        except Exception as e:
-            logger.error(f"Error processing quote tick: {e}")
-            import traceback
-            traceback.print_exc()
+        except Exception:
+            logger.exception("Error processing quote tick")
+
     async def _make_trading_decision(self, current_price):
         """Make trading decision using our 7-phase system."""
         
@@ -1250,10 +1249,8 @@ class IntegratedBTCStrategy(Strategy):
 
             self.performance_tracker.increment_order_counter("placed")
 
-        except Exception as e:
-            logger.error(f"Error placing real order: {e}")
-            import traceback
-            traceback.print_exc()
+        except Exception:
+            logger.exception("Error placing real order")
             self.performance_tracker.increment_order_counter("rejected")
 
     def _get_current_history(self) -> list:
