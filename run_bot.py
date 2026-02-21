@@ -958,18 +958,12 @@ class IntegratedBTCStrategy(Strategy):
         if not self.instrument_id:
             logger.error("No instrument available")
             return
-        
+
         try:
-            # Get instrument
-            instrument = self.cache.instrument(target_instrument_id)
-            if not instrument:
-                logger.error("Instrument not in cache")
-                return
-            
             logger.info("=" * 80)
             logger.info("LIVE MODE - PLACING REAL ORDER!")
             logger.info("=" * 80)
-            
+
             # Determine side/instrument: bullish buy YES, bearish buy NO when available
             side = OrderSide.BUY
             target_instrument_id = self.instrument_id
@@ -981,9 +975,7 @@ class IntegratedBTCStrategy(Strategy):
                     if current_condition:
                         for inst in self.cache.instruments():
                             info = inst.info if hasattr(inst, 'info') else None
-                            if not info:
-                                continue
-                            if info.get('condition_id') != current_condition:
+                            if not info or info.get('condition_id') != current_condition:
                                 continue
                             side_hint = str(info.get('outcome') or info.get('name') or info.get('title') or '').lower()
                             if 'no' in side_hint or 'down' in side_hint:
@@ -991,6 +983,12 @@ class IntegratedBTCStrategy(Strategy):
                                 break
                 except Exception:
                     pass
+
+            # Get instrument after target has been finalized
+            instrument = self.cache.instrument(target_instrument_id)
+            if not instrument:
+                logger.error("Instrument not in cache")
+                return
 
             # Slippage guard based on current top-of-book
             if self.latest_bid is not None and self.latest_ask is not None:
@@ -1009,37 +1007,41 @@ class IntegratedBTCStrategy(Strategy):
                             f"Skipping real order: expected slippage {slippage_pct:.2%} exceeds max {self.max_slippage_pct:.2%}"
                         )
                         return
-            
-            # Calculate token quantity
+
             trade_price = float(current_price)
             max_usd_amount = float(position_size)
-            
-            if trade_price > 0:
-                token_qty = max_usd_amount / trade_price
-            else:
-                token_qty = max_usd_amount * 2
-            
-            # Round to appropriate precision
-            precision = instrument.size_precision
-            token_qty = round(token_qty, precision)
-            
-            # Ensure minimum quantity
-            min_qty = 10 ** (-precision)
-            if token_qty < min_qty:
-                token_qty = min_qty
-            
-            qty = Quantity(token_qty, precision=precision)
-            
+
             # Create unique order ID
             timestamp_ms = int(time.time() * 1000)
             unique_id = f"{self.selected_symbol}-15MIN-${max_usd_amount:.0f}-{timestamp_ms}"
-            
-            if self.order_mode == "market":
-                logger.warning("ORDER_MODE=market overridden to smart_limit for live safety")
 
-            # Always use IOC limit for safer execution
-            limit_price = current_price
-            if self.latest_bid is not None and self.latest_ask is not None:
+            if self.order_mode == "market":
+                # SAFE MARKET SEMANTICS:
+                # BUY => quote notional (USDC) with quote_quantity=True
+                # SELL => disallowed unless base quantity is explicitly known
+                if side == OrderSide.BUY:
+                    quote_precision = max(2, getattr(instrument, "size_precision", 2))
+                    quote_notional = max(max_usd_amount, 0.01)
+                    qty = Quantity(quote_notional, precision=quote_precision)
+
+                    order = self.order_factory.market(
+                        instrument_id=target_instrument_id,
+                        order_side=side,
+                        quantity=qty,
+                        client_order_id=ClientOrderId(unique_id),
+                        quote_quantity=True,
+                        time_in_force=TimeInForce.IOC,
+                    )
+                    self.submit_order(order)
+                    logger.info("REAL MARKET BUY ORDER SUBMITTED!")
+                    logger.info(f"  quote_quantity=True, qty(USDC)={quote_notional:.2f}")
+                else:
+                    logger.error("Market SELL is disabled for safety unless base token quantity is explicitly known")
+                    return
+            else:
+                # Always use IOC limit for safer execution
+                limit_price = current_price
+                if self.latest_bid is not None and self.latest_ask is not None:
                     mid = (self.latest_bid + self.latest_ask) / 2
                     if side == OrderSide.BUY:
                         cap = mid * (Decimal("1") + Decimal(str(self.max_slippage_pct)))
@@ -1048,7 +1050,19 @@ class IntegratedBTCStrategy(Strategy):
                         floor = mid * (Decimal("1") - Decimal(str(self.max_slippage_pct)))
                         limit_price = max(self.latest_bid, floor)
 
-            order = self.order_factory.limit(
+                if trade_price > 0:
+                    token_qty = max_usd_amount / trade_price
+                else:
+                    token_qty = max_usd_amount * 2
+
+                precision = instrument.size_precision
+                token_qty = round(token_qty, precision)
+                min_qty = 10 ** (-precision)
+                if token_qty < min_qty:
+                    token_qty = min_qty
+
+                qty = Quantity(token_qty, precision=precision)
+                order = self.order_factory.limit(
                     instrument_id=target_instrument_id,
                     order_side=side,
                     quantity=qty,
@@ -1057,24 +1071,26 @@ class IntegratedBTCStrategy(Strategy):
                     quote_quantity=False,
                     time_in_force=TimeInForce.IOC,
                 )
-            self.submit_order(order)
-            logger.info(f"REAL SMART LIMIT ORDER SUBMITTED @ {float(limit_price):.4f}!")
+                self.submit_order(order)
+                logger.info(f"REAL SMART LIMIT ORDER SUBMITTED @ {float(limit_price):.4f}!")
+                logger.info(f"  quote_quantity=False, qty(tokens)={token_qty:.6f}")
+
             logger.info(f"  Order ID: {unique_id}")
             logger.info(f"  Side: {side.name}")
-            logger.info(f"  Token Quantity: {token_qty:.6f}")
+            logger.info(f"  Instrument: {target_instrument_id}")
             logger.info(f"  Estimated Cost: ~${max_usd_amount:.2f}")
             logger.info(f"  Price: ${trade_price:.4f}")
             logger.info("=" * 80)
-            
+
             # Track order in performance tracker
             self.performance_tracker.increment_order_counter("placed")
-            
+
         except Exception as e:
             logger.error(f"Error placing real order: {e}")
             import traceback
             traceback.print_exc()
             self.performance_tracker.increment_order_counter("rejected")
-    
+
     def _estimate_volatility_pct(self) -> Optional[float]:
         """Estimate short-horizon volatility from recent mid prices."""
         if len(self.price_history) < 20:

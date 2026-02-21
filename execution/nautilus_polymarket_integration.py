@@ -324,38 +324,45 @@ class PolymarketBTCIntegration:
                 # Use mid price
                 current_price = (quote.bid_price + quote.ask_price) / 2
             
-            # Calculate token quantity
-            # For Polymarket, tokens trade 0-1
-            # To spend $X, you need X / price tokens
-            if current_price > 0:
-                token_qty = float(size_usd) / float(current_price)
-            else:
-                token_qty = float(size_usd) * 2  # Fallback
-            
-            # Round to instrument precision
-            precision = instrument.size_precision
-            token_qty = round(token_qty, precision)
-            
-            # Create quantity
-            qty = Quantity(token_qty, precision=precision)
-            
             # Generate unique order ID
             timestamp_ms = int(datetime.now().timestamp() * 1000)
             order_id = f"BTC-15MIN-{side.upper()}-{timestamp_ms}"
-            
+
+            if order_side == OrderSide.BUY:
+                # SAFE MARKET BUY SEMANTICS: quote notional in USDC
+                quote_precision = max(2, getattr(instrument, "size_precision", 2))
+                usd_notional = max(float(size_usd), 0.01)
+                qty = Quantity(usd_notional, precision=quote_precision)
+                quote_quantity = True
+                qty_log = f"{usd_notional:.2f} USDC"
+            else:
+                # Market SELL uses base token quantity and is only allowed with explicit token size
+                token_qty = float(size_usd)
+                if token_qty <= 0:
+                    logger.error("Market SELL requires explicit base token quantity > 0")
+                    return None
+                precision = instrument.size_precision
+                token_qty = round(token_qty, precision)
+                min_qty = 10 ** (-precision)
+                if token_qty < min_qty:
+                    token_qty = min_qty
+                qty = Quantity(token_qty, precision=precision)
+                quote_quantity = False
+                qty_log = f"{token_qty:.6f} tokens"
+
             # Create market order
-            # CRITICAL: Use quote_quantity=False to specify quantity in TOKENS
             order = self.node.trader.order_factory.market(
                 instrument_id=self.btc_instrument_id,
                 order_side=order_side,
                 quantity=qty,
                 client_order_id=ClientOrderId(order_id),
-                quote_quantity=False,  # TOKENS, not USD
-                time_in_force=TimeInForce.IOC,  # Immediate or cancel
+                quote_quantity=quote_quantity,
+                time_in_force=TimeInForce.IOC,
             )
             
             # Submit order
-            logger.info(f"Submitting order: {order_side.name} {token_qty:.6f} tokens")
+            logger.info(f"Submitting order: {order_side.name} {qty_log}")
+            logger.info(f"  quote_quantity={quote_quantity}")
             logger.info(f"  Estimated cost: ${size_usd:.2f}")
             logger.info(f"  Price: ${float(current_price):.4f}")
             
