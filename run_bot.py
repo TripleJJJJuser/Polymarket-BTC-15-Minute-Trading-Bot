@@ -18,6 +18,8 @@ import time
 from dataclasses import dataclass
 from typing import List, Optional
 import random
+import json
+import urllib.request
 
 # Add project to path
 project_root = Path(__file__).parent
@@ -59,7 +61,7 @@ from nautilus_trader.adapters.polymarket.factories import (
 from nautilus_trader.trading.strategy import Strategy
 from nautilus_trader.model.identifiers import InstrumentId, ClientOrderId
 from nautilus_trader.model.enums import OrderSide, TimeInForce
-from nautilus_trader.model.objects import Quantity
+from nautilus_trader.model.objects import Quantity, Price
 from nautilus_trader.model.data import QuoteTick
 
 from dotenv import load_dotenv
@@ -133,13 +135,18 @@ class IntegratedBTCStrategy(Strategy):
     - Pre-loaded price history for immediate trading
     """
     
-    def __init__(self, redis_client=None, enable_grafana=True, test_mode=False):
+    def __init__(self, redis_client=None, enable_grafana=True, test_mode=False, simulation_mode=True, allow_redis_live_switch=False):
         super().__init__()
         
         # Nautilus
         self.instrument_id = None
         self.redis_client = redis_client
-        self.current_simulation_mode = True
+        self.current_simulation_mode = simulation_mode
+        self.allow_redis_live_switch = allow_redis_live_switch
+        self.allow_synthetic_history = simulation_mode
+        symbols_env = os.getenv("TRADE_SYMBOLS", "BTC,ETH,SOL,XRP")
+        self.trade_symbols = [sym.strip().upper() for sym in symbols_env.split(",") if sym.strip()]
+        self.selected_symbol = self.trade_symbols[0] if self.trade_symbols else "BTC"
         
         # Phase 4: Signal Processors
         self.spike_detector = SpikeDetectionProcessor(
@@ -175,6 +182,7 @@ class IntegratedBTCStrategy(Strategy):
         # Price history for signal processing
         self.price_history = []
         self.max_history = 100
+        self.real_quote_count = 0
         
         # Paper trading tracker
         self.paper_trades: List[PaperTrade] = []
@@ -184,6 +192,31 @@ class IntegratedBTCStrategy(Strategy):
         
         # Last instrument reload time
         self.last_reload_time = 0
+
+        # Prevent log spam for fallback metadata warnings
+        self._logged_simulation_fallback_warning = False
+
+        # External context cache for higher-quality metadata (spot + sentiment)
+        self._external_context_cache = {}
+        self._last_external_refresh = datetime.min.replace(tzinfo=timezone.utc)
+        self._external_refresh_seconds = int(os.getenv("EXTERNAL_CONTEXT_REFRESH_SEC", "120"))
+
+        # Learning controls
+        self._learning_interval_trades = int(os.getenv("LEARNING_INTERVAL_TRADES", "10"))
+
+        # Execution quality controls
+        self.max_spread_pct = float(os.getenv("MAX_SPREAD_PCT", "0.04"))
+        self.max_slippage_pct = float(os.getenv("MAX_SLIPPAGE_PCT", "0.02"))
+        self.min_fusion_score = float(os.getenv("MIN_FUSION_SCORE", "60"))
+        self.min_fusion_confidence = float(os.getenv("MIN_FUSION_CONFIDENCE", "0.60"))
+
+        self.latest_bid: Optional[Decimal] = None
+        self.latest_ask: Optional[Decimal] = None
+        self.decision_audit_file = os.getenv("DECISION_AUDIT_FILE", "decision_audit.jsonl")
+        self.order_mode = os.getenv("ORDER_MODE", "smart_limit").strip().lower()
+
+        self.market_recency_weight = float(os.getenv("MARKET_RECENCY_WEIGHT", "0.6"))
+        self.market_spread_weight = float(os.getenv("MARKET_SPREAD_WEIGHT", "0.4"))
 
         self.test_mode = test_mode
 
@@ -200,6 +233,7 @@ class IntegratedBTCStrategy(Strategy):
         logger.info("  Phase 7: Learning engine ready")
         logger.info("  $1 per trade maximum")
         logger.info("  Reloads instruments every 12 minutes")
+        logger.info(f"  Symbols: {', '.join(self.trade_symbols)}")
         logger.info("=" * 80)
     
     async def check_simulation_mode(self) -> bool:
@@ -212,14 +246,21 @@ class IntegratedBTCStrategy(Strategy):
             if sim_mode is not None:
                 redis_simulation = sim_mode == '1'
                 
+                if (not redis_simulation) and (not self.allow_redis_live_switch):
+                    logger.warning(
+                        "LIVE SAFETY: Redis requested live mode but redis-driven live switching is disabled. "
+                        "Ignoring request."
+                    )
+                    return self.current_simulation_mode
+
                 if redis_simulation != self.current_simulation_mode:
                     self.current_simulation_mode = redis_simulation
                     mode_text = "SIMULATION" if redis_simulation else "LIVE TRADING"
                     logger.warning(f"Trading mode changed to: {mode_text}")
-                    
+
                     if not redis_simulation:
                         logger.warning("LIVE TRADING ACTIVE - Real money at risk!")
-                
+
                 return redis_simulation
         except Exception as e:
             logger.warning(f"Failed to check Redis simulation mode: {e}")
@@ -235,14 +276,13 @@ class IntegratedBTCStrategy(Strategy):
         # Find BTC instrument FIRST and wait for it
         self._find_btc_instrument()
         
-        # Generate synthetic history regardless (for testing)
-        # This ensures we have price data even if no BTC instrument found
-        logger.info("Generating synthetic price history for testing...")
-        
-        # Check if we already have price history
-        if len(self.price_history) < 20:
-            # Generate synthetic history directly (not async since we're in sync context)
-            self._generate_synthetic_history(target_count=20, existing_count=len(self.price_history))
+        # Generate synthetic history only in simulation/test mode
+        if self.allow_synthetic_history:
+            logger.info("Generating synthetic price history for testing...")
+            if len(self.price_history) < 20:
+                self._generate_synthetic_history(target_count=20, existing_count=len(self.price_history))
+        else:
+            logger.info("LIVE SAFETY: synthetic history disabled; waiting for real market quotes.")
         
         # Try to get real price if instrument exists and we have quotes
         if self.instrument_id:
@@ -325,10 +365,16 @@ class IntegratedBTCStrategy(Strategy):
                 unique_history.append(price)
         self.price_history = unique_history
         
-        # If still not enough, generate synthetic data
+        # If still not enough, generate synthetic data only in simulation mode
         if len(self.price_history) < 20:
-            logger.warning(f"Only {len(self.price_history)} historical quotes found, generating synthetic data to fill")
-            self._generate_synthetic_history(existing_count=len(self.price_history))
+            if self.allow_synthetic_history:
+                logger.warning(f"Only {len(self.price_history)} historical quotes found, generating synthetic data to fill")
+                self._generate_synthetic_history(existing_count=len(self.price_history))
+            else:
+                logger.warning(
+                    f"LIVE SAFETY: only {len(self.price_history)} historical quotes available; "
+                    "will wait for live quotes instead of generating synthetic history"
+                )
         
         logger.info(f"Final price history: {len(self.price_history)} points")
         if len(self.price_history) >= 20:
@@ -416,7 +462,7 @@ class IntegratedBTCStrategy(Strategy):
             logger.error(f"Failed to start Grafana: {e}")
     
     def _find_btc_instrument(self):
-        """Find the CURRENT active BTC 15-min instrument."""
+        """Find the current active 15-min instrument for configured symbols."""
         instruments = self.cache.instruments()
         logger.info(f"Checking {len(instruments)} loaded instruments...")
         
@@ -436,7 +482,7 @@ class IntegratedBTCStrategy(Strategy):
                     question = instrument.info.get('question', '').lower()
                     slug = instrument.info.get('market_slug', '').lower()
                     
-                    if ('btc' in question or 'btc' in slug) and '15m' in slug:
+                    if any(sym.lower() in question or sym.lower() in slug for sym in self.trade_symbols) and '15m' in slug:
                         # Extract timestamp from slug
                         try:
                             timestamp_part = slug.split('-')[-1]
@@ -452,15 +498,29 @@ class IntegratedBTCStrategy(Strategy):
                             # Calculate time difference
                             time_diff = market_timestamp - current_timestamp
                             
+                            quote = self.cache.quote_tick(instrument.id)
+                            spread_pct = None
+                            has_quote = False
+                            if quote and quote.bid_price and quote.ask_price:
+                                bid = quote.bid_price.as_decimal()
+                                ask = quote.ask_price.as_decimal()
+                                mid = (bid + ask) / 2
+                                if mid > 0:
+                                    spread_pct = float((ask - bid) / mid)
+                                has_quote = True
+
                             btc_instruments.append({
                                 'instrument': instrument,
                                 'slug': slug,
                                 'market_timestamp': market_timestamp,
                                 'end_timestamp': end_timestamp,
                                 'question': question,
+                                'symbol': next((sym for sym in self.trade_symbols if sym.lower() in question or sym.lower() in slug), self.selected_symbol),
                                 'active': instrument.info.get('active', False),
                                 'closed': instrument.info.get('closed', True),
                                 'time_diff_minutes': time_diff / 60,  # Minutes from now
+                                'has_quote': has_quote,
+                                'spread_pct': spread_pct,
                             })
                             
                         except (ValueError, IndexError):
@@ -470,7 +530,7 @@ class IntegratedBTCStrategy(Strategy):
                 continue
         
         if not btc_instruments:
-            logger.error("NO BTC 15-MIN INSTRUMENTS FOUND!")
+            logger.error("NO 15-MIN INSTRUMENTS FOUND FOR CONFIGURED SYMBOLS!")
             return
         
         # Sort by how close they are to current time (positive means future)
@@ -479,24 +539,45 @@ class IntegratedBTCStrategy(Strategy):
         future_markets = [i for i in btc_instruments if i['time_diff_minutes'] > 0]
         
         logger.info("=" * 80)
-        logger.info("BTC 15-MIN INSTRUMENTS:")
+        logger.info("TARGET 15-MIN INSTRUMENTS:")
         for i in btc_instruments:
             status = "CURRENT" if i in current_markets else "FUTURE" if i['time_diff_minutes'] > 0 else "PAST"
             logger.info(f"  {i['slug']}: {status} (starts in {i['time_diff_minutes']:.1f} min)")
         logger.info("=" * 80)
         
-        # Select the current market if available
+        candidates = current_markets if current_markets else future_markets
+        if not candidates:
+            logger.error("No current/future 15m candidates available")
+            return
+
+        # Rank candidates by recency and execution quality (spread + quote availability)
+        for c in candidates:
+            recency_score = max(0.0, 1.0 - (abs(c['time_diff_minutes']) / 15.0))
+            spread_score = 0.0
+            if c.get('spread_pct') is not None:
+                spread_score = max(0.0, 1.0 - (c['spread_pct'] / max(self.max_spread_pct, 1e-6)))
+            quote_bonus = 0.25 if c.get('has_quote') else 0.0
+            c['selection_score'] = (
+                self.market_recency_weight * recency_score
+                + self.market_spread_weight * spread_score
+                + quote_bonus
+            )
+
+        candidates.sort(key=lambda x: x.get('selection_score', 0.0), reverse=True)
+        selected = candidates[0]
+
         if current_markets:
-            # Sort by closest to now
-            current_markets.sort(key=lambda x: abs(x['time_diff_minutes']))
-            selected = current_markets[0]
-            logger.info(f"✓ SELECTED CURRENT market: {selected['slug']}")
+            logger.info(
+                f"✓ SELECTED CURRENT market: {selected['slug']} ({selected['symbol']}) "
+                f"score={selected.get('selection_score', 0.0):.3f}"
+            )
         else:
-            # Select the next future market
-            future_markets.sort(key=lambda x: x['time_diff_minutes'])
-            selected = future_markets[0]
-            logger.info(f"⚠ No current market, selecting next: {selected['slug']} (starts in {selected['time_diff_minutes']:.1f} min)")
-        
+            logger.info(
+                f"⚠ No current market, selecting next: {selected['slug']} ({selected['symbol']}) "
+                f"(starts in {selected['time_diff_minutes']:.1f} min, score={selected.get('selection_score', 0.0):.3f})"
+            )
+
+        self.selected_symbol = selected.get('symbol', self.selected_symbol)
         self.instrument_id = selected['instrument'].id
         self.subscribe_quote_ticks(self.instrument_id)
                         
@@ -514,9 +595,12 @@ class IntegratedBTCStrategy(Strategy):
             
             # Calculate mid price
             mid_price = (bid_decimal + ask_decimal) / 2
+            self.latest_bid = bid_decimal
+            self.latest_ask = ask_decimal
             
             # Update price history
             self.price_history.append(mid_price)
+            self.real_quote_count += 1
             
             # Limit history size
             if len(self.price_history) > self.max_history:
@@ -586,6 +670,13 @@ class IntegratedBTCStrategy(Strategy):
         is_simulation = await self.check_simulation_mode()
         mode_text = "SIMULATION" if is_simulation else "LIVE TRADING"
         logger.info(f"Mode: {mode_text}")
+
+        if not is_simulation and self.real_quote_count < 20:
+            logger.warning(
+                "LIVE SAFETY: waiting for at least 20 real quote ticks before trading "
+                f"(currently {self.real_quote_count})."
+            )
+            return
         
         # Need price history
         if len(self.price_history) < 20:
@@ -594,13 +685,7 @@ class IntegratedBTCStrategy(Strategy):
         
         logger.info(f"Current price: ${float(current_price):,.4f}")
         
-        # Create test metadata with sentiment and spot price for better signals
-        # FIX: Convert everything to float consistently
-        current_price_float = float(current_price)
-        metadata = {
-            "sentiment_score": random.uniform(10, 90),  # Random sentiment for testing
-            "spot_price": current_price_float * random.uniform(0.95, 1.05),  # Random divergence as float
-        }
+        metadata = await self._build_signal_metadata(current_price=current_price, is_simulation=is_simulation)
         
         # Phase 4: Process signals
         signals = self._process_signals(current_price, metadata)
@@ -608,29 +693,43 @@ class IntegratedBTCStrategy(Strategy):
         if not signals:
             logger.info("No signals generated")
             return
-        
+
         logger.info(f"Generated {len(signals)} signals:")
         for sig in signals:
             logger.info(f"  [{sig.source}] {sig.direction.value}: score={sig.score:.1f}")
-        
+
         # Phase 4: Fuse signals
-        fused = self.fusion_engine.fuse_signals(signals, min_signals=1, min_score=60.0)
-        
+        fused = self.fusion_engine.fuse_signals(signals, min_signals=1, min_score=self.min_fusion_score)
+
         if not fused:
             logger.info("No actionable fused signal")
             return
-        
+
         logger.info(f"FUSED SIGNAL: {fused.direction.value} (score={fused.score:.1f}, confidence={fused.confidence:.2%})")
-        
+
+        if fused.confidence < self.min_fusion_confidence:
+            self._audit_decision("skipped", {"reason": "low_confidence", "confidence": fused.confidence, "score": fused.score})
+            logger.warning(f"Skipping trade: confidence {fused.confidence:.2%} below min {self.min_fusion_confidence:.2%}")
+            return
+
+        if self.latest_bid is not None and self.latest_ask is not None:
+            mid = (self.latest_bid + self.latest_ask) / 2
+            if mid > 0:
+                spread_pct = float((self.latest_ask - self.latest_bid) / mid)
+                if spread_pct > self.max_spread_pct:
+                    self._audit_decision("skipped", {"reason": "wide_spread", "spread_pct": spread_pct, "max_spread_pct": self.max_spread_pct})
+                    logger.warning(f"Skipping trade: spread {spread_pct:.2%} above max {self.max_spread_pct:.2%}")
+                    return
+
         # Phase 5: Calculate position size (with $1 cap)
         position_size = self.risk_engine.calculate_position_size(
             signal_confidence=fused.confidence,
             signal_score=fused.score,
             current_price=current_price,  # Pass Decimal to risk engine
         )
-        
+
         logger.info(f"Calculated position size: ${float(position_size):.2f}")
-        
+
         # Phase 5: Validate with risk engine
         direction = "long" if "BULLISH" in str(fused.direction) else "short"
         is_valid, error = self.risk_engine.validate_new_position(
@@ -638,17 +737,132 @@ class IntegratedBTCStrategy(Strategy):
             direction=direction,
             current_price=current_price,
         )
-        
+
         if not is_valid:
             logger.warning(f"Position rejected by risk engine: {error}")
             return
-        
+
+        self._audit_decision("accepted", {
+            "direction": direction,
+            "score": fused.score,
+            "confidence": fused.confidence,
+            "position_size": float(position_size),
+            "symbol": self.selected_symbol,
+        })
+
         # Execute trade (simulation or live based on Redis)
         if is_simulation:
             await self._record_paper_trade(fused, position_size, current_price, direction)
         else:
             await self._place_real_order(fused, position_size, current_price, direction)
+
+    async def _build_signal_metadata(self, current_price: Decimal, is_simulation: bool) -> dict:
+        """Build metadata for signal processors with live-trading safety guards."""
+        metadata = {}
+
+        env_sentiment = os.getenv("BOT_SENTIMENT_SCORE")
+        env_spot = os.getenv("BOT_SPOT_PRICE")
+
+        if env_sentiment is not None:
+            try:
+                metadata["sentiment_score"] = float(env_sentiment)
+            except ValueError:
+                logger.warning("BOT_SENTIMENT_SCORE is not numeric; ignoring")
+
+        if env_spot is not None:
+            try:
+                metadata["spot_price"] = float(env_spot)
+            except ValueError:
+                logger.warning("BOT_SPOT_PRICE is not numeric; ignoring")
+
+        if metadata:
+            return metadata
+
+        external_context = await self._get_external_context()
+        if "spot_price" in external_context:
+            metadata["spot_price"] = external_context["spot_price"]
+        if "sentiment_score" in external_context:
+            metadata["sentiment_score"] = external_context["sentiment_score"]
+
+        if metadata:
+            return metadata
+
+        if is_simulation:
+            if not self._logged_simulation_fallback_warning:
+                logger.warning(
+                    "Simulation fallback active: using synthetic sentiment/spot metadata. "
+                    "Set BOT_SENTIMENT_SCORE and BOT_SPOT_PRICE to use deterministic values."
+                )
+                self._logged_simulation_fallback_warning = True
+
+            current_price_float = float(current_price)
+            return {
+                "sentiment_score": random.uniform(10, 90),
+                "spot_price": current_price_float * random.uniform(0.95, 1.05),
+            }
+
+        logger.warning(
+            "LIVE SAFETY: no metadata configured. Sentiment/divergence processors disabled; "
+            "only spike detection will be used."
+        )
+        return {}
             
+    async def _get_external_context(self) -> dict:
+        """Get cached external context (spot + sentiment) for more accurate signals."""
+        now = datetime.now(timezone.utc)
+        age = (now - self._last_external_refresh).total_seconds()
+
+        if self._external_context_cache and age < self._external_refresh_seconds:
+            return self._external_context_cache
+
+        context = await asyncio.to_thread(self._fetch_external_context_sync)
+        if context:
+            self._external_context_cache = context
+            self._last_external_refresh = now
+
+        return self._external_context_cache
+
+    def _fetch_external_context_sync(self) -> dict:
+        """Fetch external market/sentiment data without adding event-loop coupling."""
+        context = {}
+
+        # Coinbase spot
+        try:
+            with urllib.request.urlopen(
+                "https://api.exchange.coinbase.com/products/BTC-USD/ticker", timeout=4
+            ) as response:
+                data = json.loads(response.read().decode("utf-8"))
+                spot = float(data.get("price"))
+                if spot > 0:
+                    context["spot_price"] = spot
+        except Exception as e:
+            logger.debug(f"External context: Coinbase spot unavailable ({e})")
+
+        # Fear & Greed
+        try:
+            with urllib.request.urlopen("https://api.alternative.me/fng/", timeout=4) as response:
+                data = json.loads(response.read().decode("utf-8"))
+                rows = data.get("data", [])
+                if rows:
+                    context["sentiment_score"] = float(rows[0].get("value"))
+        except Exception as e:
+            logger.debug(f"External context: sentiment unavailable ({e})")
+
+        return context
+
+    async def _maybe_optimize_weights(self) -> None:
+        """Periodically optimize fusion weights based on recent trade outcomes."""
+        trade_count = len(self.paper_trades)
+        if trade_count == 0 or trade_count % self._learning_interval_trades != 0:
+            return
+
+        try:
+            new_weights = await self.learning_engine.optimize_weights()
+            self.learning_engine.save_state()
+            logger.info(f"Learning update applied at trade #{trade_count}: {new_weights}")
+        except Exception as e:
+            logger.warning(f"Learning update failed: {e}")
+
     async def _record_paper_trade(self, signal, position_size, current_price, direction):
         """Record a paper trade for simulation tracking."""
         
@@ -706,6 +920,7 @@ class IntegratedBTCStrategy(Strategy):
                 "simulated": True,
                 "num_signals": signal.num_signals if hasattr(signal, 'num_signals') else 1,
                 "fusion_score": signal.score,
+                "signal_sources": [s.source for s in getattr(signal, "signals", [])],
             }
         )
         
@@ -728,6 +943,7 @@ class IntegratedBTCStrategy(Strategy):
         logger.info("=" * 80)
         
         self._save_paper_trades()
+        await self._maybe_optimize_weights()
             
     def _save_paper_trades(self):
         """Save paper trades to JSON file."""
@@ -759,6 +975,24 @@ class IntegratedBTCStrategy(Strategy):
             
             # Determine side
             side = OrderSide.BUY if direction == "long" else OrderSide.SELL
+
+            # Slippage guard based on current top-of-book
+            if self.latest_bid is not None and self.latest_ask is not None:
+                mid = (self.latest_bid + self.latest_ask) / 2
+                exec_ref = self.latest_ask if side == OrderSide.BUY else self.latest_bid
+                if mid > 0:
+                    slippage_pct = float(abs(exec_ref - mid) / mid)
+                    if slippage_pct > self.max_slippage_pct:
+                        self._audit_decision("skipped", {
+                            "reason": "slippage_too_high",
+                            "slippage_pct": slippage_pct,
+                            "max_slippage_pct": self.max_slippage_pct,
+                            "side": side.name,
+                        })
+                        logger.warning(
+                            f"Skipping real order: expected slippage {slippage_pct:.2%} exceeds max {self.max_slippage_pct:.2%}"
+                        )
+                        return
             
             # Calculate token quantity
             trade_price = float(current_price)
@@ -782,22 +1016,41 @@ class IntegratedBTCStrategy(Strategy):
             
             # Create unique order ID
             timestamp_ms = int(time.time() * 1000)
-            unique_id = f"BTC-15MIN-${max_usd_amount:.0f}-{timestamp_ms}"
+            unique_id = f"{self.selected_symbol}-15MIN-${max_usd_amount:.0f}-{timestamp_ms}"
             
-            # Create market order
-            order = self.order_factory.market(
-                instrument_id=self.instrument_id,
-                order_side=side,
-                quantity=qty,
-                client_order_id=ClientOrderId(unique_id),
-                quote_quantity=False,
-                time_in_force=TimeInForce.IOC,
-            )
-            
-            # Submit order
-            self.submit_order(order)
-            
-            logger.info(f"REAL ORDER SUBMITTED!")
+            if self.order_mode == "market":
+                order = self.order_factory.market(
+                    instrument_id=self.instrument_id,
+                    order_side=side,
+                    quantity=qty,
+                    client_order_id=ClientOrderId(unique_id),
+                    quote_quantity=False,
+                    time_in_force=TimeInForce.IOC,
+                )
+                self.submit_order(order)
+                logger.info("REAL MARKET ORDER SUBMITTED!")
+            else:
+                limit_price = current_price
+                if self.latest_bid is not None and self.latest_ask is not None:
+                    mid = (self.latest_bid + self.latest_ask) / 2
+                    if side == OrderSide.BUY:
+                        cap = mid * (Decimal("1") + Decimal(str(self.max_slippage_pct)))
+                        limit_price = min(self.latest_ask, cap)
+                    else:
+                        floor = mid * (Decimal("1") - Decimal(str(self.max_slippage_pct)))
+                        limit_price = max(self.latest_bid, floor)
+
+                order = self.order_factory.limit(
+                    instrument_id=self.instrument_id,
+                    order_side=side,
+                    quantity=qty,
+                    price=Price.from_str(f"{float(limit_price):.4f}"),
+                    client_order_id=ClientOrderId(unique_id),
+                    quote_quantity=False,
+                    time_in_force=TimeInForce.IOC,
+                )
+                self.submit_order(order)
+                logger.info(f"REAL SMART LIMIT ORDER SUBMITTED @ {float(limit_price):.4f}!")
             logger.info(f"  Order ID: {unique_id}")
             logger.info(f"  Side: {side.name}")
             logger.info(f"  Token Quantity: {token_qty:.6f}")
@@ -861,6 +1114,20 @@ class IntegratedBTCStrategy(Strategy):
         
         return signals
 
+    def _audit_decision(self, status: str, payload: dict) -> None:
+        """Append machine-readable decision events to local audit log."""
+        try:
+            event = {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "status": status,
+                "symbol": self.selected_symbol,
+                **payload,
+            }
+            with open(self.decision_audit_file, "a") as f:
+                f.write(json.dumps(event) + "\n")
+        except Exception as e:
+            logger.debug(f"Decision audit write failed: {e}")
+
     def on_order_filled(self, event):
         """Handle when a REAL order is filled."""
         logger.info("=" * 80)
@@ -896,10 +1163,10 @@ class IntegratedBTCStrategy(Strategy):
                 pass
 
 
-def run_integrated_bot(simulation: bool = True, enable_grafana: bool = True, test_mode: bool = False):
+def run_integrated_bot(simulation: bool = True, enable_grafana: bool = True, test_mode: bool = False, allow_redis_live_switch: bool = False):
     """Run the integrated BTC 15-min trading bot."""
     print("=" * 80)
-    print("INTEGRATED POLYMARKET BTC 15-MIN TRADING BOT")
+    print("INTEGRATED POLYMARKET 15-MIN TRADING BOT")
     print("Nautilus + 7-Phase System + Redis Control")
     print("=" * 80)
     
@@ -992,6 +1259,8 @@ def run_integrated_bot(simulation: bool = True, enable_grafana: bool = True, tes
         redis_client=redis_client,
         enable_grafana=enable_grafana,
         test_mode=test_mode,
+        simulation_mode=simulation,
+        allow_redis_live_switch=allow_redis_live_switch,
     )
     
     # Build Nautilus node
@@ -1045,6 +1314,16 @@ def main():
         action="store_true",
         help="Run in TEST MODE (trade every minute for faster testing)"
     )
+    parser.add_argument(
+        "--confirm-live",
+        action="store_true",
+        help="Required with --live to prevent accidental real-money execution"
+    )
+    parser.add_argument(
+        "--allow-redis-live-switch",
+        action="store_true",
+        help="Allow Redis control to switch from simulation to live mode at runtime"
+    )
     
     args = parser.parse_args()
     
@@ -1054,15 +1333,30 @@ def main():
     
     if not simulation:
         print("WARNING: LIVE TRADING MODE - REAL MONEY AT RISK!")
-        confirm = input("Type 'yes' to continue: ")
-        if confirm.lower() != 'yes':
-            print("Cancelled.")
+        if not args.confirm_live:
+            print("Refusing to start live trading without --confirm-live.")
+            return
+
+        if os.getenv("LIVE_TRADING_ENABLED", "").strip() != "YES_I_UNDERSTAND":
+            print("Refusing to start live trading: set LIVE_TRADING_ENABLED=YES_I_UNDERSTAND")
+            return
+
+        required_live_env = [
+            "POLYMARKET_PK",
+            "POLYMARKET_API_KEY",
+            "POLYMARKET_API_SECRET",
+            "POLYMARKET_PASSPHRASE",
+        ]
+        missing = [k for k in required_live_env if not os.getenv(k)]
+        if missing:
+            print(f"Refusing to start live trading: missing required credentials: {', '.join(missing)}")
             return
     
     run_integrated_bot(
         simulation=simulation,
         enable_grafana=enable_grafana,
-        test_mode=test_mode
+        test_mode=test_mode,
+        allow_redis_live_switch=args.allow_redis_live_switch,
     )
 
 
