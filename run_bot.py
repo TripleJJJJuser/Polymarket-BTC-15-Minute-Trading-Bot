@@ -84,7 +84,7 @@ load_dotenv()
 
 @dataclass
 class PaperTrade:
-    """Track paper/simulation trades"""
+    """Track closed paper/simulation trades."""
     timestamp: datetime
     direction: str
     size_usd: float
@@ -92,7 +92,7 @@ class PaperTrade:
     signal_score: float
     signal_confidence: float
     outcome: str = "PENDING"
-    
+
     def to_dict(self):
         return {
             'timestamp': self.timestamp.isoformat(),
@@ -103,6 +103,23 @@ class PaperTrade:
             'signal_confidence': self.signal_confidence,
             'outcome': self.outcome,
         }
+
+
+@dataclass
+class PaperPosition:
+    """Track an open paper position marked-to-market from live ticks."""
+    trade_id: str
+    entry_time: datetime
+    direction: str
+    instrument_id: InstrumentId
+    size_usd: Decimal
+    entry_mid: Decimal
+    signal_score: float
+    signal_confidence: float
+    hold_until: datetime
+    market_end_time: Optional[datetime] = None
+    latest_mid: Optional[Decimal] = None
+    unrealized_pnl_usd: Decimal = Decimal("0")
 
 
 def init_redis():
@@ -142,6 +159,7 @@ class IntegratedBTCStrategy(Strategy):
         # Nautilus
         self.instrument_id = None
         self.current_condition_id = None
+        self.current_market_end_time = None
         self.up_instrument_id = None
         self.down_instrument_id = None
         self.redis_client = redis_client
@@ -198,6 +216,7 @@ class IntegratedBTCStrategy(Strategy):
         
         # Paper trading tracker
         self.paper_trades: List[PaperTrade] = []
+        self.paper_positions: List[PaperPosition] = []
         
         # Last trading decision time (to prevent multiple trades per interval)
         self.last_trade_time = 0
@@ -601,6 +620,8 @@ class IntegratedBTCStrategy(Strategy):
 
         self.selected_symbol = selected.get("symbol", self.selected_symbol)
         self.current_condition_id = selected["condition_id"]
+        end_ts = selected.get("end_timestamp")
+        self.current_market_end_time = datetime.fromtimestamp(end_ts, tz=timezone.utc) if end_ts else None
         self.up_instrument_id = selected["tokens"]["up"]
         self.down_instrument_id = selected["tokens"]["down"]
 
@@ -656,6 +677,7 @@ class IntegratedBTCStrategy(Strategy):
             
             # Check if we should trade
             now = datetime.now(timezone.utc)
+            self._update_paper_positions(inst_id=inst_id, mid_price=mid_price, now=now)
             self._maybe_reload_instruments(now)
             
             if self.test_mode:
@@ -909,86 +931,139 @@ class IntegratedBTCStrategy(Strategy):
         except Exception as e:
             logger.warning(f"Learning update failed: {e}")
 
-    async def _record_paper_trade(self, signal, position_size, current_price, direction):
-        """Record a paper trade for simulation tracking."""
-        
-        # Simulate exit after 1 minute (for test mode) or 15 minutes (for normal mode)
-        if hasattr(self, 'test_mode') and self.test_mode:
-            exit_delta = timedelta(minutes=1)
+    def _paper_hold_delta(self) -> timedelta:
+        """Return configured paper hold period."""
+        return timedelta(minutes=1 if self.test_mode else 15)
+
+    def _update_paper_positions(self, inst_id: InstrumentId, mid_price: Decimal, now: datetime) -> None:
+        """Mark-to-market open paper positions and close when rules are met."""
+        for position in list(self.paper_positions):
+            if position.instrument_id != inst_id:
+                continue
+
+            position.latest_mid = mid_price
+            if position.entry_mid > 0:
+                position.unrealized_pnl_usd = position.size_usd * ((mid_price - position.entry_mid) / position.entry_mid)
+
+            close_reason = None
+            if now >= position.hold_until:
+                close_reason = "hold_period"
+            if position.market_end_time and now >= position.market_end_time:
+                close_reason = "market_end"
+
+            if close_reason:
+                self._close_paper_position(position=position, exit_mid=mid_price, exit_time=now, reason=close_reason)
+
+    def _close_paper_position(self, position: PaperPosition, exit_mid: Decimal, exit_time: datetime, reason: str) -> None:
+        """Close an open paper position using observed market mid."""
+        if position.entry_mid <= 0:
+            pnl = Decimal("0")
         else:
-            exit_delta = timedelta(minutes=15)
-        
-        exit_time = datetime.now(timezone.utc) + exit_delta
-        
-        # Unbiased simulation movement (avoid direction-tied optimism)
-        movement = random.uniform(-0.05, 0.05)
-        
-        exit_price = current_price * (Decimal("1.0") + Decimal(str(movement)))
-        exit_price = max(Decimal("0.01"), min(Decimal("0.99"), exit_price))
-        
-        # Calculate P&L
-        if direction == "long":
-            pnl = position_size * (exit_price - current_price) / current_price
-        else:
-            pnl = position_size * (current_price - exit_price) / current_price
-        
-        # Determine outcome
-        outcome = "WIN" if pnl > 0 else "LOSS"
+            pnl = position.size_usd * ((exit_mid - position.entry_mid) / position.entry_mid)
+
+        outcome = "WIN" if pnl > 0 else "LOSS" if pnl < 0 else "FLAT"
         self.risk_engine.register_trade_result(pnl)
-        
-        # Create paper trade record with outcome
+
         paper_trade = PaperTrade(
-            timestamp=datetime.now(timezone.utc),
-            direction=direction.upper(),
-            size_usd=float(position_size),
-            price=float(current_price),
-            signal_score=signal.score,
-            signal_confidence=signal.confidence,
-            outcome=outcome,  # ← NOW SETTING OUTCOME!
+            timestamp=exit_time,
+            direction=position.direction.upper(),
+            size_usd=float(position.size_usd),
+            price=float(position.entry_mid),
+            signal_score=position.signal_score,
+            signal_confidence=position.signal_confidence,
+            outcome=outcome,
         )
-        
         self.paper_trades.append(paper_trade)
-        
-        # Record in performance tracker
+
         self.performance_tracker.record_trade(
-            trade_id=f"paper_{int(datetime.now().timestamp())}",
-            direction=direction,
-            entry_price=current_price,
-            exit_price=exit_price,
-            size=position_size,
-            entry_time=datetime.now(timezone.utc),
+            trade_id=position.trade_id,
+            direction=position.direction,
+            entry_price=position.entry_mid,
+            exit_price=exit_mid,
+            size=position.size_usd,
+            entry_time=position.entry_time,
             exit_time=exit_time,
-            signal_score=signal.score,
-            signal_confidence=signal.confidence,
+            signal_score=position.signal_score,
+            signal_confidence=position.signal_confidence,
             metadata={
                 "simulated": True,
-                "num_signals": signal.num_signals if hasattr(signal, 'num_signals') else 1,
-                "fusion_score": signal.score,
-                "signal_sources": [s.source for s in getattr(signal, "signals", [])],
-            }
+                "instrument_id": str(position.instrument_id),
+                "close_reason": reason,
+                "hold_seconds": (position.hold_until - position.entry_time).total_seconds(),
+            },
         )
-        
-        # Update metrics in grafana exporter
-        if hasattr(self, 'grafana_exporter') and self.grafana_exporter:
+
+        if self.grafana_exporter:
             self.grafana_exporter.increment_trade_counter(won=(pnl > 0))
-            self.grafana_exporter.record_trade_duration(exit_delta.total_seconds())
-        
+            self.grafana_exporter.record_trade_duration((exit_time - position.entry_time).total_seconds())
+
         logger.info("=" * 80)
-        logger.info("[SIMULATION] PAPER TRADE RECORDED")
-        logger.info(f"  Direction: {direction.upper()}")
-        logger.info(f"  Size: ${float(position_size):.2f}")
-        logger.info(f"  Entry Price: ${float(current_price):,.4f}")
-        logger.info(f"  Simulated Exit: ${float(exit_price):,.4f}")
-        logger.info(f"  Simulated P&L: ${float(pnl):+.2f} ({movement*100:+.2f}%)")
+        logger.info("[SIMULATION] PAPER POSITION CLOSED")
+        logger.info(f"  Trade ID: {position.trade_id}")
+        logger.info(f"  Direction: {position.direction.upper()} (BUY token)")
+        logger.info(f"  Instrument: {position.instrument_id}")
+        logger.info(f"  Size: ${float(position.size_usd):.2f}")
+        logger.info(f"  Entry Mid: ${float(position.entry_mid):,.4f}")
+        logger.info(f"  Exit Mid: ${float(exit_mid):,.4f}")
+        logger.info(f"  Realized P&L: ${float(pnl):+.2f}")
         logger.info(f"  Outcome: {outcome}")
-        logger.info(f"  Signal Score: {signal.score:.1f}")
-        logger.info(f"  Signal Confidence: {signal.confidence:.2%}")
-        logger.info(f"  Total Paper Trades: {len(self.paper_trades)}")
+        logger.info(f"  Close Reason: {reason}")
+        logger.info(f"  Total Closed Paper Trades: {len(self.paper_trades)}")
         logger.info("=" * 80)
-        
+
+        self.paper_positions.remove(position)
         self._save_paper_trades()
-        await self._maybe_optimize_weights()
-            
+
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(self._maybe_optimize_weights())
+        except RuntimeError:
+            logger.debug("No running event loop for optimize_weights scheduling")
+
+    async def _record_paper_trade(self, signal, position_size, current_price, direction):
+        """Open a paper position tracked by real observed mid prices."""
+        target_instrument_id = self.up_instrument_id if direction == "long" else self.down_instrument_id
+        if not target_instrument_id:
+            logger.warning("Simulation skip: no target paired instrument for paper position")
+            return
+
+        quote = self.cache.quote_tick(target_instrument_id)
+        entry_mid = current_price
+        if quote and quote.bid_price and quote.ask_price:
+            entry_mid = (quote.bid_price.as_decimal() + quote.ask_price.as_decimal()) / 2
+
+        now = datetime.now(timezone.utc)
+        hold_delta = self._paper_hold_delta()
+        trade_id = f"paper_{int(now.timestamp() * 1000)}"
+
+        position = PaperPosition(
+            trade_id=trade_id,
+            entry_time=now,
+            direction=direction,
+            instrument_id=target_instrument_id,
+            size_usd=position_size,
+            entry_mid=entry_mid,
+            latest_mid=entry_mid,
+            signal_score=signal.score,
+            signal_confidence=signal.confidence,
+            hold_until=now + hold_delta,
+            market_end_time=self.current_market_end_time,
+        )
+        self.paper_positions.append(position)
+
+        logger.info("=" * 80)
+        logger.info("[SIMULATION] PAPER POSITION OPENED")
+        logger.info(f"  Trade ID: {trade_id}")
+        logger.info(f"  Direction: {direction.upper()} (BUY token)")
+        logger.info(f"  Instrument: {target_instrument_id}")
+        logger.info(f"  Size: ${float(position_size):.2f}")
+        logger.info(f"  Entry Mid: ${float(entry_mid):,.4f}")
+        logger.info(f"  Hold Until: {(now + hold_delta).isoformat()}")
+        if self.current_market_end_time:
+            logger.info(f"  Market End: {self.current_market_end_time.isoformat()}")
+        logger.info(f"  Open Paper Positions: {len(self.paper_positions)}")
+        logger.info("=" * 80)
+
     def _save_paper_trades(self):
         """Save paper trades to JSON file."""
         import json
@@ -1231,8 +1306,19 @@ class IntegratedBTCStrategy(Strategy):
     def on_stop(self):
         """Called when strategy stops."""
         logger.info("Integrated BTC strategy stopped")
+
+        stop_time = datetime.now(timezone.utc)
+        for position in list(self.paper_positions):
+            exit_mid = position.latest_mid if position.latest_mid is not None else position.entry_mid
+            self._close_paper_position(
+                position=position,
+                exit_mid=exit_mid,
+                exit_time=stop_time,
+                reason="strategy_stop",
+            )
+
         logger.info(f"Total paper trades recorded: {len(self.paper_trades)}")
-        
+
         if self.grafana_exporter:
             try:
                 loop = asyncio.get_running_loop()
