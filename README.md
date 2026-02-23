@@ -17,6 +17,7 @@ A production-grade algorithmic trading bot for **Polymarket's 15-minute BTC pric
 - [Architecture](#architecture)
 - [Prerequisites](#prerequisites)
 - [Quick Start](#quick-start)
+- [Setup Guide](#setup-guide)
 - [Configuration](#configuration)
 - [Running the Bot](#running-the-bot)
 - [Monitoring](#monitoring)
@@ -79,6 +80,11 @@ A production-grade algorithmic trading bot for **Polymarket's 15-minute BTC pric
 
 - Polymarket Account with API credentials
 - Git
+
+
+## 🧰 Setup Guide
+
+For a safer step-by-step path (simulation-first, then live), see **[SETUP.md](SETUP.md)**.
 
 ## 🚀 Quick Start
 
